@@ -5,6 +5,7 @@ verification, and 1D corporate-action event merging.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import random
 import re
@@ -88,10 +89,10 @@ def verify_cookie_tier(
 
 
 DEFAULT_STUDY_DESCRIPTORS: list[tuple[str, str, str]] = [
-    ("st_splits", "Splits@tv-basicstudies-53!", "raw_split"),
-    ("st_divs", "Dividends@tv-basicstudies-103!", "raw_dividend"),
-    ("st_earns", "Earnings@tv-basicstudies-122!", "raw_earnings"),
-    ("st_rolls", "BarSetContinuousRollDates@tv-corestudies-24!", "raw_roll"),
+    ("st_splits", "Splits@tv-basicstudies-281", "raw_split"),
+    ("st_divs", "Dividends@tv-basicstudies-281", "raw_dividend"),
+    ("st_earns", "Earnings@tv-basicstudies-281", "raw_earnings"),
+    ("st_rolls", "BarSetContinuousRollDates@tv-corestudies-50", "raw_roll"),
 ]
 
 
@@ -143,19 +144,18 @@ def resolve_live_study_descriptors(jwt_token: str) -> list[tuple[str, str, str]]
                     params = data.get("p", [])
                     meta = params[1] if len(params) > 1 else params[0]
                     for item in meta.get("metainfo", []):
-                        sid = item.get("id", "")
+                        sid = item.get("id", "").rstrip("!")
+                        if "PriceSupport" in sid:
+                            continue
                         for prefix in targets:
                             if sid.startswith(prefix):
-                                ver_str = sid.replace(prefix, "").rstrip("!")
+                                ver_str = sid.replace(prefix, "")
                                 try:
                                     ver = int(ver_str)
                                 except ValueError:
                                     ver = 0
                                 if prefix not in best_versions or ver >= best_versions[prefix][0]:
-                                    best_versions[prefix] = (
-                                        ver,
-                                        sid if sid.endswith("!") else f"{sid}!",
-                                    )
+                                    best_versions[prefix] = (ver, sid)
                     done = True
                     break
 
@@ -193,7 +193,10 @@ def merge_events_to_1d(
     """
     Attach raw corporate-action and roll study payloads (`raw_split`,
     `raw_dividend`, `raw_earnings`, `raw_roll`, `last_splits`) onto the matching
-    (or nearest preceding) `1D` bar in `bars`.
+    `1D` bar in `bars`.
+
+    In TradingView's study response (`data[st_id]["st"]`), each item has
+    `"v": [bar_ts, ...]`, where `v[0]` is the exact `1D` bar unix timestamp.
     """
     if not bars:
         return
@@ -204,30 +207,43 @@ def merge_events_to_1d(
         "raw_earnings": 8,
         "raw_roll": 9,
     }
+    date_to_ts: dict[str, float] = {}
     for ts in sorted_ts:
         while len(bars[ts]) < 11:
             bars[ts].append(None)
+        d_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+        date_to_ts[d_str] = ts
 
+    # 1. Map splits from quote_data["last_splits"] by UTC date if present
+    last_splits = quote_data.get("last_splits", [])
+    if isinstance(last_splits, list) and last_splits:
+        for sp_item in last_splits:
+            if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2:
+                try:
+                    d_str = datetime.fromtimestamp(int(sp_item[0]), tz=timezone.utc).strftime("%Y-%m-%d")
+                    if d_str in date_to_ts:
+                        bars[date_to_ts[d_str]][6] = json.dumps(sp_item)
+                except Exception:
+                    pass
+        if sorted_ts:
+            bars[sorted_ts[-1]][10] = json.dumps(last_splits)
+
+    # 2. Map study events (`st` items where v[0] is bar timestamp)
     for col_name, events in study_events.items():
         if not events:
             continue
         c_idx = col_idx_map[col_name]
         for ev in events:
-            raw_time = ev.get("v", [None, None])[1]
-            if raw_time is None:
+            v = ev.get("v", [])
+            if not v or v[0] is None:
                 continue
-            ev_ts = raw_time / 1000.0 if raw_time > 1e11 else float(raw_time)
+            ev_ts = float(v[0])
             matched_ts = None
             if ev_ts in bars:
                 matched_ts = ev_ts
             else:
-                for b_ts in reversed(sorted_ts):
-                    if b_ts <= ev_ts and (ev_ts - b_ts) <= 86400 * 5:
-                        matched_ts = b_ts
-                        break
+                ev_d = datetime.fromtimestamp(int(ev_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+                if ev_d in date_to_ts:
+                    matched_ts = date_to_ts[ev_d]
             if matched_ts is not None:
-                bars[matched_ts][c_idx] = json.dumps(ev.get("v", []))
-
-    if "last_splits" in quote_data and sorted_ts:
-        bars[sorted_ts[-1]][10] = json.dumps(quote_data["last_splits"])
-
+                bars[matched_ts][c_idx] = json.dumps(v)

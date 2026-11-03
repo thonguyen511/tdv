@@ -127,6 +127,12 @@ def _execute_task_on_ws(
 
     if is_1d and quote_session:
         ws.send(create_ws_message("quote_create_session", [quote_session]))
+        ws.send(
+            create_ws_message(
+                "quote_set_fields",
+                [quote_session, "base_name", "short_name", "last_splits"],
+            )
+        )
         ws.send(create_ws_message("quote_add_symbols", [quote_session, symbol]))
         ws.send(create_ws_message("quote_fast_symbols", [quote_session, symbol]))
 
@@ -147,12 +153,19 @@ def _execute_task_on_ws(
 
     study_col_map: dict[str, str] = {}
     if is_1d:
-        for st_id, st_script, col_name in ctx.study_descriptors:
+        for idx_st, (st_id, st_script, col_name) in enumerate(ctx.study_descriptors):
             study_col_map[st_id] = col_name
             ws.send(
                 create_ws_message(
                     "create_study",
-                    [chart_session, st_id, "st1", series_id, st_script, {}],
+                    [
+                        chart_session,
+                        st_id,
+                        f"st{idx_st}",
+                        series_id,
+                        st_script,
+                        {"currenttime": "now"},
+                    ],
                 )
             )
 
@@ -246,9 +259,12 @@ def _execute_task_on_ws(
                 if is_1d:
                     for st_id, col_name in study_col_map.items():
                         if st_id in payload_dict:
-                            st_s = payload_dict[st_id].get("s", [])
-                            if st_s:
-                                study_events[col_name].extend(st_s)
+                            st_items = (
+                                payload_dict[st_id].get("st", [])
+                                or payload_dict[st_id].get("s", [])
+                            )
+                            if st_items:
+                                study_events[col_name].extend(st_items)
 
             elif m_type == "series_completed":
                 current_count = len(bars)

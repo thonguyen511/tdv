@@ -1,34 +1,37 @@
 """
-Symbol universe loader and balanced 20-node chunk-aware `map.json` planner.
+Symbol extraction (`get_symbols_from_file` with `EXCHANGE:SYMBOL` and futures
+`contracts` expansion) and `map.json` management (`generate_split_map`,
+`update_map_incremental`, `get_assigned_csv_files`).
 
-Supports both:
-- String entries `"EXCHANGE.csv"` (all 2,000-symbol chunks of that exchange file)
-- Range dict entries `{"file": "EXCHANGE.csv", "chunk_start": 1, "chunk_end": 50}`
-  (1-based inclusive chunk slice of an oversized file such as `FINRA.csv`),
-  guaranteeing zero bucket file collisions and balanced ~52-chunk (~79.5k symbol)
-  workloads across all 20 Kaggle nodes.
+Preserves the exact ticker extraction and greedy whole-file `map.json` format
+from `src/src_1/core/generate_map.py` and `github/tdv_aio/code/initial.py`.
 """
 
 from __future__ import annotations
 
+import ast
+import csv
 import json
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import pandas as pd
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tdv.config import CHUNK_SIZE, TOTAL_NOTEBOOKS
 
+# Increase CSV field size limit so large `contracts` lists in futures CSVs never fail
+try:
+    csv.field_size_limit(min(sys.maxsize, 2147483647))
+except Exception:
+    pass
+
 
 @dataclass(frozen=True)
 class ChunkAssignment:
-    """A single 2,000-symbol chunk assigned to a node."""
+    """A single 2,000-symbol chunk of an exchange CSV assigned to a node."""
 
     exchange: str
     csv_name: str
@@ -37,35 +40,120 @@ class ChunkAssignment:
     symbols: list[str]
 
 
-def load_symbols_from_csv(csv_path: Path) -> list[str]:
-    """Load, clean, and deduplicate symbols from an exchange CSV while preserving order."""
-    df = pd.read_csv(csv_path, usecols=lambda c: c == "symbol", dtype=str)
-    if "symbol" not in df.columns:
-        return []
-    raw_syms = df["symbol"].dropna().astype(str).str.strip().tolist()
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for s in raw_syms:
-        if s and s not in seen:
-            seen.add(s)
-            deduped.append(s)
-    return deduped
+def get_symbols_from_file(file_path: str | Path) -> list[str]:
+    """
+    Extract full `EXCHANGE:SYMBOL` tickers from a CSV file, expanding futures
+    `contracts` (`f"{prefix}:{c['symbol']}"`) when present.
+    """
+    symbols: list[str] = []
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return symbols
+            try:
+                ex_idx = header.index("exchange_code")
+                sym_idx = header.index("symbol")
+                contracts_idx = header.index("contracts") if "contracts" in header else -1
+            except ValueError:
+                return symbols
+
+            for row in reader:
+                if len(row) > max(ex_idx, sym_idx):
+                    base_symbol = row[sym_idx].strip()
+                    if not base_symbol:
+                        continue
+                    extracted_symbols: list[str] = []
+
+                    if contracts_idx != -1 and len(row) > contracts_idx:
+                        contracts_str = row[contracts_idx].strip()
+                        if contracts_str.startswith("["):
+                            try:
+                                contracts_list = ast.literal_eval(contracts_str)
+                                if isinstance(contracts_list, list) and len(contracts_list) > 0:
+                                    for c in contracts_list:
+                                        if isinstance(c, dict) and c.get("symbol"):
+                                            prefix = str(c.get("prefix", row[ex_idx].strip())).strip()
+                                            extracted_symbols.append(f"{prefix}:{c['symbol']}")
+                            except Exception:
+                                pass
+
+                    if not extracted_symbols:
+                        extracted_symbols.append(f"{row[ex_idx].strip()}:{base_symbol}")
+
+                    for sym in extracted_symbols:
+                        symbols.append(sym)
+    except Exception as exc:
+        print(f"[MapPlanner] ERROR reading {file_path}: {exc}", flush=True)
+    return list(dict.fromkeys(symbols))
+
+
+# Alias for backwards compatibility inside tdv
+load_symbols_from_csv = get_symbols_from_file
+
+
+def get_assigned_csv_files(repo_path: str | Path, notebook_index: int) -> list[Path]:
+    """Load `map.json` and return the CSV file paths assigned to `notebook_index`."""
+    root = Path(repo_path)
+    map_file = root / "map.json"
+    if not map_file.exists():
+        raise FileNotFoundError(f"map.json not found in {root}")
+
+    node_mappings = json.loads(map_file.read_text(encoding="utf-8"))
+    assigned_entry: dict[str, Any] | None = None
+
+    if isinstance(node_mappings, list):
+        for entry in node_mappings:
+            if isinstance(entry, dict) and int(entry.get("node_index", -1)) == int(notebook_index):
+                assigned_entry = entry
+                break
+        raw_files = assigned_entry.get("files", []) if assigned_entry else []
+    elif isinstance(node_mappings, dict):
+        raw_files = node_mappings.get(str(notebook_index), [])
+    else:
+        raw_files = []
+
+    if assigned_entry is None and not raw_files:
+        raise ValueError(f"No entry found in map.json for node_index={notebook_index}")
+
+    assigned_files: list[Path] = []
+    for item in raw_files:
+        fname = item["file"] if isinstance(item, dict) else str(item)
+        fpath = root / fname
+        if not fpath.exists():
+            alt_path = root / "data" / fname
+            if alt_path.exists():
+                fpath = alt_path
+        if fpath.exists():
+            assigned_files.append(fpath)
+        else:
+            print(f"[MapPlanner] Warning: Assigned file {fname} not found in {root}", flush=True)
+
+    return assigned_files
 
 
 def expand_node_assignments(
-    map_data: dict[str, list[Any]],
+    map_data: list[dict[str, Any]] | dict[str, Any],
     notebook_id: int,
     data_dir: Path,
     chunk_size: int = CHUNK_SIZE,
 ) -> list[ChunkAssignment]:
     """
-    Expand the `map.json` entries for `notebook_id` into concrete `ChunkAssignment`
-    objects (each up to `chunk_size = 2000` symbols).
+    Expand `map.json` entries for `notebook_id` into 2,000-symbol `ChunkAssignment`
+    objects using `get_symbols_from_file` (`EXCHANGE:SYMBOL` + `contracts` expansion).
     """
-    entries = map_data.get(str(notebook_id), [])
-    assignments: list[ChunkAssignment] = []
+    raw_entries: list[Any] = []
+    if isinstance(map_data, list):
+        for node_obj in map_data:
+            if isinstance(node_obj, dict) and int(node_obj.get("node_index", -1)) == int(notebook_id):
+                raw_entries = list(node_obj.get("files", []))
+                break
+    elif isinstance(map_data, dict):
+        raw_entries = list(map_data.get(str(notebook_id), []))
 
-    for entry in entries:
+    assignments: list[ChunkAssignment] = []
+    for entry in raw_entries:
         if isinstance(entry, str):
             csv_name = entry
             chunk_start = 1
@@ -79,10 +167,14 @@ def expand_node_assignments(
 
         csv_path = data_dir / csv_name
         if not csv_path.exists():
-            print(f"[MapPlanner] Warning: CSV file not found: {csv_path}", flush=True)
-            continue
+            alt = data_dir.parent / csv_name
+            if alt.exists():
+                csv_path = alt
+            else:
+                print(f"[MapPlanner] Warning: CSV file not found: {csv_path}", flush=True)
+                continue
 
-        symbols = load_symbols_from_csv(csv_path)
+        symbols = get_symbols_from_file(csv_path)
         if not symbols:
             continue
 
@@ -108,65 +200,96 @@ def expand_node_assignments(
     return assignments
 
 
-def generate_balanced_map(
-    data_dir: Path,
-    num_nodes: int = TOTAL_NOTEBOOKS,
-    chunk_size: int = CHUNK_SIZE,
-    max_whole_file_chunks: int = 45,
-) -> dict[str, list[Any]]:
+def generate_split_map(
+    csv_dir: str | Path,
+    map_file: str | Path | None = None,
+    total_nodes: int = TOTAL_NOTEBOOKS,
+) -> list[dict[str, Any]]:
     """
-    Partition all `*.csv` files in `data_dir` across `num_nodes` notebooks so
-    each node receives an almost identical symbol/chunk count.
-
-    Files with more than `max_whole_file_chunks` chunks (such as `FINRA.csv` with
-    149 chunks) are split into contiguous chunk-range dicts
-    `{"file": "FINRA.csv", "chunk_start": s, "chunk_end": e}` (~30 chunks each),
-    while smaller files are kept intact as plain `"EXCHANGE.csv"` strings.
+    Generate the greedy whole-file split `map.json` across `total_nodes` nodes
+    (matching `src/src_1/core/generate_map.py`).
     """
-    csv_files = sorted(data_dir.glob("*.csv"))
-    work_units: list[tuple[int, Any]] = []  # (symbol_count, map_entry)
+    c_dir = Path(csv_dir)
+    csv_files = sorted(f.name for f in c_dir.glob("*.csv"))
+    file_counts: list[dict[str, Any]] = []
 
-    split_slice_chunks = 30
-    for csv_path in csv_files:
-        syms = load_symbols_from_csv(csv_path)
-        n_syms = len(syms)
-        if n_syms == 0:
-            continue
-        n_chunks = math.ceil(n_syms / chunk_size)
-        if n_chunks > max_whole_file_chunks:
-            for c_start in range(1, n_chunks + 1, split_slice_chunks):
-                c_end = min(n_chunks, c_start + split_slice_chunks - 1)
-                slice_syms = len(syms[(c_start - 1) * chunk_size : c_end * chunk_size])
-                work_units.append(
-                    (
-                        slice_syms,
-                        {
-                            "file": csv_path.name,
-                            "chunk_start": c_start,
-                            "chunk_end": c_end,
-                        },
-                    )
-                )
-        else:
-            work_units.append((n_syms, csv_path.name))
+    for fname in csv_files:
+        count = len(get_symbols_from_file(c_dir / fname))
+        file_counts.append({"path": fname, "symbols": count})
 
-    # Greedy largest-processing-time (LPT) assignment across the 20 nodes
-    work_units.sort(key=lambda x: x[0], reverse=True)
-    node_loads = [0 for _ in range(num_nodes)]
-    node_entries: dict[str, list[Any]] = {str(i): [] for i in range(num_nodes)}
+    file_counts.sort(key=lambda x: x["symbols"], reverse=True)
+    nodes: list[dict[str, Any]] = [
+        {"node_index": i, "total_symbols": 0, "files": []} for i in range(total_nodes)
+    ]
 
-    for sym_count, entry in work_units:
-        lightest_node = min(range(num_nodes), key=lambda i: node_loads[i])
-        node_entries[str(lightest_node)].append(entry)
-        node_loads[lightest_node] += sym_count
+    for f_info in file_counts:
+        lightest = min(nodes, key=lambda n: n["total_symbols"])
+        lightest["files"].append(f_info["path"])
+        lightest["total_symbols"] += f_info["symbols"]
 
-    return node_entries
+    if map_file is not None:
+        Path(map_file).write_text(json.dumps(nodes, indent=4), encoding="utf-8")
+
+    return nodes
+
+
+def update_map_incremental(
+    csv_dir: str | Path,
+    map_file: str | Path,
+    total_nodes: int = TOTAL_NOTEBOOKS,
+) -> list[dict[str, Any]]:
+    """Incrementally update `map.json` with any new CSV files or updated symbol counts."""
+    m_path = Path(map_file)
+    c_dir = Path(csv_dir)
+    if not m_path.exists():
+        return generate_split_map(c_dir, m_path, total_nodes)
+
+    try:
+        nodes = json.loads(m_path.read_text(encoding="utf-8"))
+        if not isinstance(nodes, list):
+            return generate_split_map(c_dir, m_path, total_nodes)
+    except Exception:
+        return generate_split_map(c_dir, m_path, total_nodes)
+
+    csv_files_set = {f.name for f in c_dir.glob("*.csv")}
+    mapped_files: set[str] = set()
+    counts_changed = False
+
+    for n in nodes:
+        existing_node_files = [f for f in n.get("files", []) if f in csv_files_set]
+        if len(existing_node_files) != len(n.get("files", [])):
+            n["files"] = existing_node_files
+            counts_changed = True
+        mapped_files.update(existing_node_files)
+        recalculated_total = sum(
+            len(get_symbols_from_file(c_dir / fname)) for fname in existing_node_files
+        )
+        if n.get("total_symbols") != recalculated_total:
+            n["total_symbols"] = recalculated_total
+            counts_changed = True
+
+    new_files = sorted(f for f in csv_files_set if f not in mapped_files)
+    if not new_files and not counts_changed:
+        return nodes
+
+    if new_files:
+        file_counts = [
+            {"path": f, "symbols": len(get_symbols_from_file(c_dir / f))}
+            for f in new_files
+        ]
+        file_counts.sort(key=lambda x: x["symbols"], reverse=True)
+        for f_info in file_counts:
+            lightest = min(nodes, key=lambda n: n["total_symbols"])
+            lightest["files"].append(f_info["path"])
+            lightest["total_symbols"] += f_info["symbols"]
+
+    m_path.write_text(json.dumps(nodes, indent=4), encoding="utf-8")
+    return nodes
 
 
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parent.parent
     d_dir = repo_root / "data"
     out_map = repo_root / "map.json"
-    balanced = generate_balanced_map(d_dir)
-    out_map.write_text(json.dumps(balanced, indent=2), encoding="utf-8")
-    print(f"Generated balanced map at {out_map}")
+    generate_split_map(d_dir, out_map, TOTAL_NOTEBOOKS)
+    print(f"Generated greedy whole-file map at {out_map}")

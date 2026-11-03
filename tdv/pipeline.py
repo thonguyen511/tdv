@@ -4,16 +4,20 @@ and Phase 2 (Weekly Maintenance).
 
 Stage 1 (per 2,000-symbol chunk):
   - Scrape `1D` bars + dynamic corporate action & roll studies (`Splits`, `Dividends`,
-    `Earnings`, `RollDates`, `last_splits`).
+    `Earnings`, `RollDates`, `last_splits`) using full `EXCHANGE:SYMBOL` tickers
+    (and expanded futures `contracts`).
   - Record `has_intraday` and `has_adjustment` from `symbol_resolved`.
   - Overwrite-merge and encrypt `1D` chunk.
 
 Stage 2 (per 2,000-symbol chunk):
   - Queue `1W` and `1M` for all valid symbols.
   - Queue intraday intervals (`1`, `5`, `15`, `60`, `240`) ONLY for symbols where
-    Stage 1 reported `has_intraday == True`. Mark daily-only symbols with
-    `SKIPPED_NO_INTRADAY` in `checkpoint.log`.
+    Stage 1 reported `has_intraday == True`. Log daily-only symbols in `checkpoint.log`
+    as `{timestamp}, {sym}, INTRADAY, skipped, has_intraday is False`.
   - Overwrite-merge and encrypt each interval's `.parquet.enc` chunk.
+  - Log every saved symbol with its bar count and full bucket chunk path in
+    `checkpoint.log`:
+    `{timestamp}, {sym}, {interval}, checkpoint, Bars: {c}, data/{exchange}/{interval}/{exchange}_{interval}_chunk_{chunk_idx}.parquet.enc`
   - Atomically batch-upload all interval `.parquet.enc` files + updated
     `checkpoint.log` and `failures.log` to the Hugging Face Storage Bucket.
 """
@@ -73,22 +77,29 @@ COLUMNS_STANDARD = ["symbol", "time", "open", "high", "low", "close", "volume"]
 
 def _parse_checkpoint_text(raw_text: str) -> tuple[set[tuple[str, str]], dict[str, bool]]:
     """
-    Parse `checkpoint.log` lines into:
+    Parse `checkpoint.log` (and `failures.log`) lines into:
     - `completed_pairs`: set of `(symbol, interval)` pairs already completed or skipped
     - `known_intraday`: dict mapping `symbol -> has_intraday` inferred from prior logs
+
+    Supports the full log format:
+    - `2026-11-03 12:00:00, NASDAQ:NVDA, 1D, checkpoint, Bars: 6988, data/NASDAQ/1D/NASDAQ_1D_chunk_6.parquet.enc`
+    - `2026-11-03 12:00:00, OTC:ABCD, INTRADAY, skipped, has_intraday is False`
     """
     completed_pairs: set[tuple[str, str]] = set()
     known_intraday: dict[str, bool] = {}
     for line in raw_text.splitlines():
-        parts = line.strip().split(",")
+        parts = [p.strip() for p in line.strip().split(",")]
         if len(parts) >= 3:
             sym, iv = parts[1], parts[2]
-            status = parts[3] if len(parts) >= 4 else "OK"
-            completed_pairs.add((sym, iv))
-            if status == "SKIPPED_NO_INTRADAY":
+            status = parts[3] if len(parts) >= 4 else "checkpoint"
+            if iv == "INTRADAY" or status in ("skipped", "SKIPPED_NO_INTRADAY"):
                 known_intraday[sym] = False
-            elif iv in INTRADAY_INTERVALS and status == "OK":
-                known_intraday[sym] = True
+                for intra_iv in INTRADAY_INTERVALS:
+                    completed_pairs.add((sym, intra_iv))
+            else:
+                completed_pairs.add((sym, iv))
+                if iv in INTRADAY_INTERVALS and status in ("checkpoint", "OK"):
+                    known_intraday[sym] = True
     return completed_pairs, known_intraday
 
 
@@ -99,14 +110,15 @@ def _merge_and_encrypt_interval_chunk(
     chunk_idx: int,
     new_rows: list[list[Any]],
     fernet_key: bytes,
-) -> bytes:
+) -> tuple[bytes, dict[str, int]]:
     """
     Download existing `.parquet.enc` chunk from the bucket (if present), merge
     `new_rows` deduplicated by `["symbol", "time"]` (`keep="last"`), sort by
-    `["symbol", "time"]`, and return encrypted `.parquet.enc` bytes.
+    `["symbol", "time"]`, and return `(encrypted_parquet_bytes, new_symbol_bar_counts)`.
     """
     cols = COLUMNS_1D if interval == STAGE1_INTERVAL else COLUMNS_STANDARD
     new_df = pd.DataFrame(new_rows, columns=cols)
+    new_symbol_counts = {str(k): int(v) for k, v in new_df["symbol"].value_counts().to_dict().items()}
 
     existing_df, exists_on_bucket = bucket.download_encrypted_chunk(
         exchange=exchange,
@@ -122,7 +134,7 @@ def _merge_and_encrypt_interval_chunk(
 
     combined_df.sort_values(by=["symbol", "time"], inplace=True)
     combined_df.reset_index(drop=True, inplace=True)
-    return encrypt_dataframe_parquet(combined_df, fernet_key)
+    return encrypt_dataframe_parquet(combined_df, fernet_key), new_symbol_counts
 
 
 def run_node_pipeline(
@@ -257,6 +269,10 @@ def run_node_pipeline(
     existing_fail_bytes = bucket.download_bytes(remote_failures_path, must_exist=False)
     if existing_fail_bytes is not None:
         local_failures.write_bytes(existing_fail_bytes)
+        fail_pairs, _ = _parse_checkpoint_text(
+            existing_fail_bytes.decode("utf-8", errors="replace")
+        )
+        completed_pairs.update(fail_pairs)
     else:
         local_failures.write_text("", encoding="utf-8")
 
@@ -335,7 +351,7 @@ def run_node_pipeline(
         # STAGE 2: Macro (1W, 1M) + has_intraday-Filtered Intraday (1..240)
         # -------------------------------------------------------------------
         tasks_stage2: list[TaskItem] = []
-        skipped_intraday_logs: list[tuple[str, str, str]] = []
+        intraday_skipped_syms: list[str] = []
 
         for sym in chunk_syms:
             meta = ctx.symbol_metadata.get(sym, {})
@@ -354,9 +370,10 @@ def run_node_pipeline(
                     if (sym, intra_iv) not in completed_pairs:
                         tasks_stage2.append(TaskItem(symbol=sym, interval=intra_iv))
             else:
-                for intra_iv in INTRADAY_INTERVALS:
-                    if (sym, intra_iv) not in completed_pairs:
-                        skipped_intraday_logs.append((sym, intra_iv, "SKIPPED_NO_INTRADAY"))
+                if any((sym, intra_iv) not in completed_pairs for intra_iv in INTRADAY_INTERVALS):
+                    intraday_skipped_syms.append(sym)
+                    for intra_iv in INTRADAY_INTERVALS:
+                        completed_pairs.add((sym, intra_iv))
 
         if tasks_stage2:
             intra_sym_count = sum(
@@ -386,11 +403,14 @@ def run_node_pipeline(
         # Merge, Encrypt & Atomically Upload Chunk + Logs to Bucket
         # -------------------------------------------------------------------
         batch_uploads: list[tuple[bytes | str | Path, str]] = []
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        checkpoint_lines: list[str] = []
+
         for interval in ALL_INTERVALS:
             rows = ctx.chunk_bars.get(interval, [])
             if not rows:
                 continue
-            enc_bytes = _merge_and_encrypt_interval_chunk(
+            enc_bytes, sym_counts = _merge_and_encrypt_interval_chunk(
                 bucket=bucket,
                 exchange=exchange,
                 interval=interval,
@@ -401,19 +421,30 @@ def run_node_pipeline(
             remote_chunk_path = get_chunk_bucket_path(exchange, interval, chunk_idx)
             batch_uploads.append((enc_bytes, remote_chunk_path))
 
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        all_cp_entries = ctx.success_logs + skipped_intraday_logs
-        if all_cp_entries:
+            # Log full symbol, bar count, and full bucket path in checkpoint.log (matching old code)
+            for sym_name, b_count in sym_counts.items():
+                checkpoint_lines.append(
+                    f"{now_ts}, {sym_name}, {interval}, checkpoint, Bars: {b_count}, {remote_chunk_path}"
+                )
+                completed_pairs.add((sym_name, interval))
+
+        # Log skipped intraday symbols in checkpoint.log (matching old code)
+        for sym_name in intraday_skipped_syms:
+            checkpoint_lines.append(
+                f"{now_ts}, {sym_name}, INTRADAY, skipped, has_intraday is False"
+            )
+
+        if checkpoint_lines:
             with local_checkpoint.open("a", encoding="utf-8") as f_cp:
-                for sym, iv, status_tag in all_cp_entries:
-                    f_cp.write(f"{now_iso},{sym},{iv},{status_tag}\n")
-                    completed_pairs.add((sym, iv))
+                for line in checkpoint_lines:
+                    f_cp.write(line + "\n")
 
         if ctx.failure_logs:
             with local_failures.open("a", encoding="utf-8") as f_fl:
                 for sym, iv, reason in ctx.failure_logs:
-                    clean_reason = reason.replace("\n", " ").replace("\r", " ")
-                    f_fl.write(f"{now_iso},{sym},{iv},{clean_reason}\n")
+                    clean_reason = reason.replace("\n", " ").replace("\r", " ").strip()
+                    f_fl.write(f"{now_ts}, {sym}, {iv}, tradingview_error, {clean_reason}\n")
+                    completed_pairs.add((sym, iv))
 
         batch_uploads.append((local_checkpoint.read_bytes(), remote_checkpoint_path))
         batch_uploads.append((local_failures.read_bytes(), remote_failures_path))
@@ -440,4 +471,3 @@ def run_node_pipeline(
         pass
 
     return EXIT_OK
-
