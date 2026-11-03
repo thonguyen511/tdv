@@ -46,6 +46,13 @@ from tdv.config import (
 
 KAGGLE_API_BASE = "https://www.kaggle.com/api/v1"
 
+DEFAULT_ACCOUNT_USERNAMES: dict[int, str] = {
+    0: "thonguyen511",
+    1: "hero0511acc",
+    2: "tqunacc",
+    3: "acc3conheo",
+}
+
 
 def load_kaggle_tokens() -> list[str]:
     """Load `KAGGLE_TOKEN_0..3` from environment variables."""
@@ -109,33 +116,66 @@ def get_kaggle_username(api_token: str) -> str | None:
 
 def get_kernel_state(username: str, slug: str, api_token: str) -> str:
     """
-    Query Kaggle's REST API for the live status of `username/slug`.
+    Query Kaggle for the live session status of `username/slug`.
 
     Returns one of: `"running"`, `"queued"`, `"complete"`, `"error"`,
     `"cancelacknowledged"`, `"cancelrequested"`, `"not_found"`, or `"unknown"`.
     """
     if not username or not api_token:
         return "unknown"
-    headers = {"Authorization": f"Bearer {api_token}", "Accept": "application/json"}
+
+    # 1. Try kagglesdk / KaggleApi in-process (works on both Windows and Linux without spawning CLI)
+    prev_tok = os.environ.get("KAGGLE_API_TOKEN")
+    os.environ["KAGGLE_API_TOKEN"] = api_token
     try:
-        resp = requests.get(
-            f"{KAGGLE_API_BASE}/kernels/status",
-            headers=headers,
-            params={"userName": username, "kernelSlug": slug},
-            timeout=15,
-        )
-        if resp.status_code == 404 or resp.status_code == 403:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+
+        api = KaggleApi()
+        api.authenticate()
+        resp = api.kernels_status(f"{username}/{slug}")
+        raw_status = str(getattr(resp, "status", "") or "").strip().lower()
+        if "." in raw_status:
+            raw_status = raw_status.split(".")[-1]
+        if raw_status:
+            return raw_status
+    except ValueError as ve:
+        if "cannot access kernel" in str(ve).lower() or "403" in str(ve) or "404" in str(ve):
             return "not_found"
-        if resp.status_code == 200:
-            data = resp.json()
-            status_val = str(data.get("status", "")).strip().lower()
-            if status_val:
-                # Normalize e.g. KernelWorkerStatus.COMPLETE or "complete"
+    except Exception:
+        pass
+    finally:
+        if prev_tok is None:
+            os.environ.pop("KAGGLE_API_TOKEN", None)
+        else:
+            os.environ["KAGGLE_API_TOKEN"] = prev_tok
+
+    # 2. Fallback to POST/GET REST endpoint
+    headers = {"Authorization": f"Bearer {api_token}", "Accept": "application/json"}
+    for method in ("POST", "GET"):
+        try:
+            if method == "POST":
+                r = requests.post(
+                    f"{KAGGLE_API_BASE}/kernels/status",
+                    headers=headers,
+                    json={"userName": username, "kernelSlug": slug},
+                    timeout=15,
+                )
+            else:
+                r = requests.get(
+                    f"{KAGGLE_API_BASE}/kernels/status",
+                    headers=headers,
+                    params={"userName": username, "kernelSlug": slug},
+                    timeout=15,
+                )
+            if r.status_code == 200:
+                data = r.json()
+                status_val = str(data.get("status", "")).strip().lower()
                 if "." in status_val:
                     status_val = status_val.split(".")[-1]
-                return status_val
-    except Exception as exc:
-        print(f"[FleetManager] REST status check warning for {username}/{slug}: {exc}", flush=True)
+                if status_val:
+                    return status_val
+        except Exception:
+            pass
     return "unknown"
 
 
@@ -355,6 +395,27 @@ def _push_kernel_via_cli(
             json.dumps(metadata, indent=2), encoding="utf-8"
         )
 
+        prev_tok = os.environ.get("KAGGLE_API_TOKEN")
+        os.environ["KAGGLE_API_TOKEN"] = api_token
+        try:
+            from kaggle.api.kaggle_api_extended import KaggleApi
+
+            api = KaggleApi()
+            api.authenticate()
+            resp = api.kernels_push(str(tmp_path))
+            err_msg = getattr(resp, "error", None)
+            if not err_msg:
+                url = getattr(resp, "url", f"https://www.kaggle.com/code/{username}/{slug}")
+                print(f"[FleetManager] Pushed {username}/{slug} -> {url}", flush=True)
+                return True
+        except Exception:
+            pass
+        finally:
+            if prev_tok is None:
+                os.environ.pop("KAGGLE_API_TOKEN", None)
+            else:
+                os.environ["KAGGLE_API_TOKEN"] = prev_tok
+
         env = os.environ.copy()
         env["KAGGLE_API_TOKEN"] = api_token
         res = subprocess.run(
@@ -454,7 +515,7 @@ def resolve_all_usernames(tokens: list[str]) -> dict[int, str]:
     usernames: dict[int, str] = {}
     for idx, tok in enumerate(tokens):
         if tok:
-            uname = get_kaggle_username(tok)
+            uname = DEFAULT_ACCOUNT_USERNAMES.get(idx) or get_kaggle_username(tok)
             if uname:
                 usernames[idx] = uname
     return usernames
