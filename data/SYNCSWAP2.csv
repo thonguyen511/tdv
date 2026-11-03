@@ -1,0 +1,7 @@
+exchange_code,symbol,description,type,exchange,source_id,typespecs,prefix,source2_id_name_description
+SYNCSWAP2,LETHWETH_724299,Liquid ETH / Wrapped Ether on ZKSYNC (0x724299572209d25aD8C1864737cA0accCB0925C6),spot,SyncSwap v2 zkSync,SYNCSWAP2,crypto,SYNCSWAP2,"SYNCSWAP2, SyncSwap v2 on zkSync, SyncSwap v2 on zkSync"
+SYNCSWAP2,LETHWETH_724299.USD,Liquid ETH / Wrapped Ether on ZKSYNC (0x724299572209d25aD8C1864737cA0accCB0925C6) in USD,spot,SyncSwap v2 zkSync,SYNCSWAP2,crypto,SYNCSWAP2,"SYNCSWAP2, SyncSwap v2 on zkSync, SyncSwap v2 on zkSync"
+SYNCSWAP2,VNOWETH_EFF7EA,VenoToken / Wrapped Ether on ZKSYNC (0xeFF7ea0713764A38D45c2a75b39486b2BbcE28ce),spot,SyncSwap v2 zkSync,SYNCSWAP2,crypto,SYNCSWAP2,"SYNCSWAP2, SyncSwap v2 on zkSync, SyncSwap v2 on zkSync"
+SYNCSWAP2,VNOWETH_EFF7EA.USD,VenoToken / Wrapped Ether on ZKSYNC (0xeFF7ea0713764A38D45c2a75b39486b2BbcE28ce) in USD,spot,SyncSwap v2 zkSync,SYNCSWAP2,crypto,SYNCSWAP2,"SYNCSWAP2, SyncSwap v2 on zkSync, SyncSwap v2 on zkSync"
+SYNCSWAP2,WSTETHWETH_12E7A9,Wrapped liquid staked Ether 20 / Wrapped Ether on ZKSYNC (0x12e7A9423d9128287E63017eE6d1f20e1C237f15),spot,SyncSwap v2 zkSync,SYNCSWAP2,crypto,SYNCSWAP2,"SYNCSWAP2, SyncSwap v2 on zkSync, SyncSwap v2 on zkSync"
+SYNCSWAP2,WSTETHWETH_12E7A9.USD,Wrapped liquid staked Ether 20 / Wrapped Ether on ZKSYNC (0x12e7A9423d9128287E63017eE6d1f20e1C237f15) in USD,spot,SyncSwap v2 zkSync,SYNCSWAP2,crypto,SYNCSWAP2,"SYNCSWAP2, SyncSwap v2 on zkSync, SyncSwap v2 on zkSync"

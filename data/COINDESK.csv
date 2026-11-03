@@ -1,0 +1,9 @@
+exchange_code,symbol,description,type,exchange,source_id,typespecs,prefix,params,source2_id_name_description
+COINDESK,CD20SPOT,CoinDesk 20 Spot Index,index,CoinDesk Indices,COINDESK,crypto,COINDESK,,"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CD100,CoinDesk 100 Index,index,CoinDesk Indices,COINDESK,crypto,COINDESK,,"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CDMEME,CoinDesk Memecoin Index,index,CoinDesk Indices,COINDESK,crypto,COINDESK,,"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CD5,CoinDesk 5 Index,index,CoinDesk Indices,COINDESK,crypto,COINDESK,,"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CD80,CoinDesk 80 Index,index,CoinDesk Indices,COINDESK,crypto,COINDESK,,"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CDORAUSC,CoinDesk Aave USDC Overnight Rate,index,CoinDesk Indices,COINDESK,crypto,COINDESK,['eod'],"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CDORAUST,CoinDesk Aave USDT Overnight Rate,index,CoinDesk Indices,COINDESK,crypto,COINDESK,['eod'],"COINDESK, CoinDesk, CoinDesk"
+COINDESK,CESR,CoinDesk Composite Ether Staking Rate,index,CoinDesk Indices,COINDESK,crypto,COINDESK,['eod'],"COINDESK, CoinDesk, CoinDesk"

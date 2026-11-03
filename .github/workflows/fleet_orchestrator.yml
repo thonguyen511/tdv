@@ -1,0 +1,94 @@
+name: TDV Fleet Orchestrator
+
+on:
+  # 1. Event-driven callback webhook from Kaggle worker nodes and Standby Clock (NO cron schedule!)
+  repository_dispatch:
+    types: [node_callback]
+
+  # 2. Manual control from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform (reconcile, status, push_standby, reset_initial, trigger_weekly)"
+        required: true
+        default: "reconcile"
+        type: choice
+        options:
+          - reconcile
+          - status
+          - push_standby
+          - reset_initial
+          - trigger_weekly
+      node_id:
+        description: "Optional specific node ID (0..19) to force-push"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: tdv-fleet-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KAGGLE_TOKEN_0: ${{ secrets.KAGGLE_TOKEN_0 }}
+      KAGGLE_TOKEN_1: ${{ secrets.KAGGLE_TOKEN_1 }}
+      KAGGLE_TOKEN_2: ${{ secrets.KAGGLE_TOKEN_2 }}
+      KAGGLE_TOKEN_3: ${{ secrets.KAGGLE_TOKEN_3 }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_BUCKET_ID: "thonguyen511/temp"
+      DATA_PASSWORD: ${{ secrets.DATA_PASSWORD }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GITHUB_REPO: ${{ github.repository }}
+      TV_LOGIN_PASSWORD: ${{ secrets.TV_LOGIN_PASSWORD }}
+      TV_SESSIONS_JSON: ${{ secrets.TV_SESSIONS_JSON }}
+      TV_EMAILS_JSON: ${{ secrets.TV_EMAILS_JSON }}
+      TV_ULTIMATE_SESSIONID: ${{ secrets.TV_ULTIMATE_SESSIONID }}
+      TV_ULTIMATE_SESSIONID_SIGN: ${{ secrets.TV_ULTIMATE_SESSIONID_SIGN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "kaggle>=2.0.0" six "huggingface_hub>=1.5.0" "hf-xet>=1.5.2" cryptography pandas pyarrow requests websocket-client
+
+      - name: Handle Kaggle Node Callback (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        env:
+          CB_NODE_ID: ${{ github.event.client_payload.node_id }}
+          CB_STATUS: ${{ github.event.client_payload.status }}
+        run: |
+          echo "Received callback from Node ${CB_NODE_ID} with status ${CB_STATUS}"
+          python fleet_manager.py --callback-node "${CB_NODE_ID}" --callback-status "${CB_STATUS}"
+
+      - name: Handle Manual Workflow Dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_NODE: ${{ github.event.inputs.node_id }}
+        run: |
+          if [ -n "${TARGET_NODE}" ]; then
+            python fleet_manager.py --push-node "${TARGET_NODE}"
+          elif [ "${ACTION}" = "status" ]; then
+            python fleet_manager.py --status
+          elif [ "${ACTION}" = "push_standby" ]; then
+            python fleet_manager.py --push-standby
+          elif [ "${ACTION}" = "reset_initial" ]; then
+            python fleet_manager.py --reset-phase initial --reconcile
+          elif [ "${ACTION}" = "trigger_weekly" ]; then
+            python fleet_manager.py --callback-node 99 --callback-status TRIGGER_WEEKLY
+          else
+            python fleet_manager.py --reconcile
+          fi
+

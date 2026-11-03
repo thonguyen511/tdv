@@ -1,0 +1,5 @@
+exchange_code,symbol,description,type,exchange,source_id,params,source2_id_name_description
+AAII,BULLISH,Bullish sentiment,index,AAII,AAII,['eod'],"AAII, AAII, AAII"
+AAII,BEARISH,Bearish sentiment,index,AAII,AAII,['eod'],"AAII, AAII, AAII"
+AAII,BULL_BEAR_SPREAD,Bull-Bear spread,index,AAII,AAII,['eod'],"AAII, AAII, AAII"
+AAII,NEUTRAL,Neutral sentiment,index,AAII,AAII,['eod'],"AAII, AAII, AAII"

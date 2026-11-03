@@ -1,0 +1,11 @@
+exchange_code,symbol,description,type,exchange,source_id,typespecs,prefix,source2_id_name_description
+RAMSES2,DAOUSDC_D89A69,DAO Maker / USD Coin on ARBITRUM (0xD89a69FbA3FCF693F3a84A9902bF2e513AA7D70c),spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,DAOUSDC_D89A69.USD,DAO Maker / USD Coin on ARBITRUM (0xD89a69FbA3FCF693F3a84A9902bF2e513AA7D70c) in USD,spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,FLYWHEELWETH_1C5FEA,FLYWHEEL / Wrapped Ether on ARBITRUM (0x1C5Fea8B49661EBe0A6d4896e67679507E703e3e),spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,FLYWHEELWETH_1C5FEA.USD,FLYWHEEL / Wrapped Ether on ARBITRUM (0x1C5Fea8B49661EBe0A6d4896e67679507E703e3e) in USD,spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,USDFIWETH_485FA3,USDFI / Wrapped Ether on ARBITRUM (0x485Fa30Dd17BD30a22e22c61f1bfE3ee47ee3FA2),spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,USDFIWETH_485FA3.USD,USDFI / Wrapped Ether on ARBITRUM (0x485Fa30Dd17BD30a22e22c61f1bfE3ee47ee3FA2) in USD,spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,WBTCWETH_2760CC,Wrapped BTC / Wrapped Ether on ARBITRUM (0x2760cC828B2e4D04f8eC261A5335426bb22d9291),spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,WBTCWETH_2760CC.USD,Wrapped BTC / Wrapped Ether on ARBITRUM (0x2760cC828B2e4D04f8eC261A5335426bb22d9291) in USD,spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,WETHUSDC_30AFBC,Wrapped Ether / USD Coin on ARBITRUM (0x30AFBcF9458c3131A6d051C621E307E6278E4110),spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"
+RAMSES2,WETHUSDC_30AFBC.USD,Wrapped Ether / USD Coin on ARBITRUM (0x30AFBcF9458c3131A6d051C621E307E6278E4110) in USD,spot,Ramses v2 Arbitrum,RAMSES2,crypto,RAMSES2,"RAMSES2, Ramses v2 on Arbitrum, Ramses v2 on Arbitrum"

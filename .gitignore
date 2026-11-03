@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+staging/
+.env
+*.parquet
+*.parquet.enc
+*.log
+.DS_Store
+

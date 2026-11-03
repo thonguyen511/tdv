@@ -1,0 +1,12 @@
+exchange_code,symbol,description,type,exchange,source_id,typespecs,prefix,source2_id_name_description
+BITFLYER,BTCJPY,Bitcoin / Yen,spot,bitFlyer,BITFLYER,"crypto, defi",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,ETHJPY,ETH_JPY,spot,bitFlyer,BITFLYER,"crypto, defi",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,XRPJPY,XRP_JPY,spot,bitFlyer,BITFLYER,crypto,BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,FXBTCJPY,FX Bitcoin / Yen,spot,bitFlyer,BITFLYER,"crypto, defi",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,XLMJPY,XLM_JPY,spot,bitFlyer,BITFLYER,"crypto, defi",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,BCHUSD,Bitcoin Cash / US Dollar,spot,bitFlyer,BITFLYER,"crypto, tv-calculated-pair, synthetic",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,ETHUSD,Ethereum / US Dollar,spot,bitFlyer,BITFLYER,"crypto, tv-calculated-pair, synthetic",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,MONAJPY,MONA_JPY,spot,bitFlyer,BITFLYER,crypto,BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,BCHBTC,Bitcoin Cash / Bitcoin,spot,bitFlyer,BITFLYER,"crypto, defi",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,ELFJPY,ELF_JPY,spot,bitFlyer,BITFLYER,crypto,BITFLYER,"BITFLYER, BitFlyer, BitFlyer"
+BITFLYER,ETHBTC,Ethereum / Bitcoin,spot,bitFlyer,BITFLYER,"crypto, defi",BITFLYER,"BITFLYER, BitFlyer, BitFlyer"

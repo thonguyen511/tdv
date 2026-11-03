@@ -1,0 +1,4 @@
+exchange_code,symbol,description,type,exchange,source_id,typespecs,params,prefix,source2_id_name_description
+BNC,BLX,Bitcoin Liquid Index,index,Brave New Coin,BNC,"crypto, discontinued",['eod'],BNC,"BNC, Brave New Coin, Brave New Coin"
+BNC,ELX,Ethereum Liquid Index,index,Brave New Coin,BNC,"crypto, discontinued",['eod'],BNC,"BNC, Brave New Coin, Brave New Coin"
+BNC,XRPLX,XRP Liquid Index,index,Brave New Coin,BNC,"crypto, discontinued",['eod'],BNC,"BNC, Brave New Coin, Brave New Coin"
