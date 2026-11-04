@@ -107,88 +107,95 @@ DEFAULT_STUDY_SCRIPTS: dict[str, str] = {
 }
 
 
-def resolve_live_study_descriptors(jwt_token: str) -> dict[str, str]:
+def resolve_live_study_descriptors(jwt_token: str, max_attempts: int = 3) -> dict[str, str]:
     """
-    Query TradingView's live `request_studies_metadata` endpoint once at startup
-    to resolve the latest study version numbers for Dividends, Earnings, and
-    Continuous Roll Dates. Falls back to `DEFAULT_STUDY_SCRIPTS` on timeout.
+    Query TradingView's live `request_studies_metadata` endpoint at startup
+    (with up to `max_attempts` retries) to dynamically resolve the latest study
+    version numbers for Dividends, Earnings, and Continuous Roll Dates.
+    Falls back to `DEFAULT_STUDY_SCRIPTS` only if all attempts fail.
     """
     scripts = dict(DEFAULT_STUDY_SCRIPTS)
-    ws = None
-    try:
-        ws = websocket.create_connection(
-            "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&type=chart",
-            header=[
-                "Origin: https://www.tradingview.com",
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            ],
-            sslopt={"cert_reqs": ssl.CERT_NONE},
-            timeout=15,
-        )
-        ws.send(create_ws_message("set_auth_token", [jwt_token]))
-        ws.send(create_ws_message("request_studies_metadata", ["st_meta_req"]))
+    targets: dict[str, str] = {
+        "Dividends@tv-basicstudies-": "dividends",
+        "Earnings@tv-basicstudies-": "earnings",
+        "BarSetContinuousRollDates@tv-corestudies-": "rolls",
+    }
 
-        targets: dict[str, str] = {
-            "Dividends@tv-basicstudies-": "dividends",
-            "Earnings@tv-basicstudies-": "earnings",
-            "BarSetContinuousRollDates@tv-corestudies-": "rolls",
-        }
-        best_versions: dict[str, tuple[int, str]] = {}
-        buf = ""
-        start = time.time()
-        done = False
-
-        while time.time() - start < 10.0 and not done:
-            raw = ws.recv()
-            if not raw:
-                break
-            buf += raw
-            msgs, buf = parse_ws_messages(buf)
-            for msg in msgs:
-                if msg.startswith("~h~"):
-                    ws.send(f"~m~{len(msg)}~m~{msg}")
-                    continue
-                if not msg.startswith("{"):
-                    continue
-                data = json.loads(msg)
-                if data.get("m") == "studies_metadata":
-                    params = data.get("p", [])
-                    meta = params[1] if len(params) > 1 else params[0]
-                    for item in meta.get("metainfo", []):
-                        sid = item.get("id", "").rstrip("!")
-                        if "PriceSupport" in sid:
-                            continue
-                        for prefix, key_name in targets.items():
-                            if sid.startswith(prefix):
-                                ver_str = sid.replace(prefix, "")
-                                try:
-                                    ver = int(ver_str)
-                                except ValueError:
-                                    ver = 0
-                                if key_name not in best_versions or ver >= best_versions[key_name][0]:
-                                    best_versions[key_name] = (ver, sid)
-                    done = True
-                    break
-
-        if best_versions:
-            for key_name, (_, sid) in best_versions.items():
-                scripts[key_name] = sid
-            print(
-                f"[Protocol] Dynamically resolved study versions: {scripts}",
-                flush=True,
+    for attempt in range(1, max_attempts + 1):
+        ws = None
+        try:
+            ws = websocket.create_connection(
+                "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&type=chart",
+                header=[
+                    "Origin: https://www.tradingview.com",
+                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                ],
+                sslopt={"cert_reqs": ssl.CERT_NONE},
+                timeout=15,
             )
-            return scripts
-    except Exception as exc:
-        print(
-            f"[Protocol] Dynamic study metadata lookup fallback to defaults ({exc})",
-            flush=True,
-        )
-    finally:
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+            ws.recv()  # Initial handshake frame
+            ws.send(create_ws_message("set_auth_token", [jwt_token]))
+            ws.send(create_ws_message("request_studies_metadata", ["st_meta_req"]))
+
+            best_versions: dict[str, tuple[int, str]] = {}
+            buf = ""
+            start = time.time()
+            done = False
+
+            while time.time() - start < 10.0 and not done:
+                raw = ws.recv()
+                if not raw:
+                    break
+                buf += raw
+                msgs, buf = parse_ws_messages(buf)
+                for msg in msgs:
+                    if msg.startswith("~h~"):
+                        ws.send(f"~m~{len(msg)}~m~{msg}")
+                        continue
+                    if not msg.startswith("{"):
+                        continue
+                    data = json.loads(msg)
+                    if data.get("m") == "studies_metadata":
+                        params = data.get("p", [])
+                        meta = params[1] if len(params) > 1 else params[0]
+                        for item in meta.get("metainfo", []):
+                            sid = item.get("id", "").rstrip("!")
+                            if "PriceSupport" in sid:
+                                continue
+                            for prefix, key_name in targets.items():
+                                if sid.startswith(prefix):
+                                    ver_str = sid.replace(prefix, "")
+                                    try:
+                                        ver = int(ver_str)
+                                    except ValueError:
+                                        ver = 0
+                                    if key_name not in best_versions or ver >= best_versions[key_name][0]:
+                                        best_versions[key_name] = (ver, sid)
+                        done = True
+                        break
+
+            if best_versions:
+                for key_name, (_, sid) in best_versions.items():
+                    scripts[key_name] = sid
+                print(
+                    f"[Protocol] Dynamically resolved study versions: {scripts}",
+                    flush=True,
+                )
+                return scripts
+        except Exception as exc:
+            if attempt == max_attempts:
+                print(
+                    f"[Protocol] Dynamic study metadata lookup fallback to defaults after {max_attempts} attempts ({exc})",
+                    flush=True,
+                )
+            else:
+                time.sleep(1.0 * attempt)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
     return scripts
 
 
