@@ -1,59 +1,64 @@
 """
-Persistent WebSocket worker threads for the two-stage TradingView pipeline.
+Persistent WebSocket Worker Pool for Two-Stage Chunk Execution.
 
-Key features:
-- Requests raw unadjusted bars via `{"symbol": symbol, "adjustment": "none"}` in
-  `resolve_symbol`.
-- Records `has_intraday` and `has_adjustment` from `symbol_resolved` during
-  Stage 1 (`1D`) so Stage 2 only queues eligible symbols for intraday intervals.
-- Supports both Phase 1 (`fetch_full_history=True`, looping `request_more_data`
-  backwards up to `MAX_HISTORY_BATCHES`) and Phase 2 (`fetch_full_history=False`,
-  single-batch recent history fetch).
-- Fixes the worker pool routing bug: when running on the Free account pool
-  (no Ultimate account), all 8 workers service Stage 1 (`1D`) and Stage 2
-  (`1W`, `1M`, and eligible intraday intervals). When an Ultimate account is
-  configured, 5 Ultimate workers + 3 Free workers run in dual-pool mode, with
-  Ultimate workers also assisting on `1D`/`1W`/`1M` whenever `intraday_queue`
-  is empty.
-- Never scrapes with `unauthorized_user_token`: if JWT refresh raises `TVAuthError`,
-  signals `auth_failed_event` immediately.
+Implements:
+- Persistent WebSocket connections per worker thread (reused across tasks by
+  creating/deleting `chart_create_session` and `quote_create_session` on the
+  open socket, matching `run_first/worker_pool.py` and `run_weekly/event_fetcher.py`).
+- Stage 1 (`1D`):
+  - Non-futures: Quote Session (`quote_set_fields` `["base_name", "last_splits"]`)
+    + Chart Studies (`Dividends`, `Earnings` with `{}`).
+  - Futures (`is_futures=True`): Chart Studies (`st_roll_a` with `{"currenttime": "now"}`
+    and `st_roll_b` with `{}` on `BarSetContinuousRollDates`).
+  - Waits for `main_series_completed` AND `required_studies.issubset(completed_studies)`.
+  - Captures `has_intraday` from `symbol_resolved`.
+- Stage 2 (`1W`, `1M`, and `has_intraday`-filtered intraday `1, 5, 15, 60, 240`):
+  - Backwards paging via `request_more_data` in Phase 1 (`fetch_full_history=True`).
+  - Single-batch fetch in Phase 2 (`fetch_full_history=False`).
+  - Attaches corporate actions (`raw_split`, `raw_dividend`, `raw_earnings`, `raw_roll`)
+    to all intervals via `attach_events_to_df`.
 """
 
 from __future__ import annotations
 
 import json
 import queue
+import random
 import ssl
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+import pandas as pd
 import websocket
 
-from tdv.config import (
-    BARS_INITIAL_LOAD,
-    BARS_MORE_LOAD,
-    MAX_HISTORY_BATCHES,
-    MAX_TASK_RETRIES,
-)
+from tdv.config import BARS_INITIAL_LOAD, BARS_MORE_LOAD, MAX_HISTORY_BATCHES, MAX_TASK_RETRIES
 from tdv.jwt_manager import JWTManager, TVAuthError
-from tdv.protocol import create_ws_message, generate_session, merge_events_to_1d, parse_ws_messages
+from tdv.protocol import (
+    DEFAULT_STUDY_SCRIPTS,
+    attach_events_to_df,
+    create_ws_message,
+    generate_session_id,
+    parse_ws_messages,
+)
 
 
 @dataclass
 class TaskItem:
     symbol: str
     interval: str
+    is_futures: bool = False
     retries: int = 0
 
 
 @dataclass
 class ChunkExecutionContext:
-    """Shared per-chunk state across the 8 worker threads."""
+    """Shared state for a single 2,000-symbol chunk across the 8-worker pool."""
 
     fetch_full_history: bool
-    study_descriptors: list[tuple[str, str, str]]
+    study_scripts: dict[str, str]
     jwt_manager: JWTManager
     has_ultimate: bool = False
     ultimate_jwt: str | None = None
@@ -62,37 +67,33 @@ class ChunkExecutionContext:
     primary_queue: queue.Queue[TaskItem | None] = field(default_factory=queue.Queue)
     intraday_queue: queue.Queue[TaskItem | None] = field(default_factory=queue.Queue)
 
-    # Locks & Synchronization
+    # Collected results (protected by results_lock)
     results_lock: threading.Lock = field(default_factory=threading.Lock)
+    chunk_dfs: dict[str, list[pd.DataFrame]] = field(default_factory=dict)
+    symbol_events: dict[str, dict[str, Any]] = field(default_factory=dict)
+    symbol_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    success_logs: list[tuple[str, str, str]] = field(default_factory=list)
+    failure_logs: list[tuple[str, str, str]] = field(default_factory=list)
+    network_retry_tasks: list[TaskItem] = field(default_factory=list)
+
+    # Abort / Auth flags
     abort_event: threading.Event = field(default_factory=threading.Event)
     auth_failed_event: threading.Event = field(default_factory=threading.Event)
-
-    # Outputs populated by workers
-    # interval -> list[row]
-    chunk_bars: dict[str, list[list[Any]]] = field(default_factory=dict)
-    # symbol -> {"has_intraday": bool, "has_adjustment": bool}
-    symbol_metadata: dict[str, dict[str, bool]] = field(default_factory=dict)
-    # [(symbol, interval, status_tag)]
-    success_logs: list[tuple[str, str, str]] = field(default_factory=list)
-    # [(symbol, interval, reason)]
-    failure_logs: list[tuple[str, str, str]] = field(default_factory=list)
-    # Tasks that suffered transient network errors and need retry
-    network_retry_tasks: list[TaskItem] = field(default_factory=list)
     consecutive_429_errors: int = 0
 
 
-def _connect_ws(endpoint: str, jwt_token: str) -> websocket.WebSocket:
-    ws_url = f"wss://{endpoint}/socket.io/websocket?from=chart%2F&type=chart"
-    headers = [
-        "Origin: https://www.tradingview.com",
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    ]
+def _connect_ws(endpoint: str, jwt_token: str, timeout: int = 15) -> websocket.WebSocket:
+    """Open a TradingView WebSocket connection and authenticate with `jwt_token`."""
     ws = websocket.create_connection(
-        ws_url,
-        header=headers,
-        timeout=25,
+        f"wss://{endpoint}/socket.io/websocket?from=chart%2F&type=chart",
+        header=[
+            "Origin: https://www.tradingview.com",
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        ],
         sslopt={"cert_reqs": ssl.CERT_NONE},
+        timeout=timeout,
     )
+    ws.recv()  # Read initial handshake packet
     ws.send(create_ws_message("set_auth_token", [jwt_token]))
     return ws
 
@@ -102,46 +103,53 @@ def _execute_task_on_ws(
     ws_buffer: str,
     task: TaskItem,
     ctx: ChunkExecutionContext,
-) -> tuple[str, str, str, dict[float, list[Any]], dict[str, list[dict[str, Any]]], dict[str, Any], dict[str, bool]]:
+) -> tuple[
+    str,
+    str,
+    str,
+    dict[float, list[Any]],
+    dict[str, list[Any]],
+    dict[str, bool],
+]:
     """
-    Execute a single `(symbol, interval)` scrape over an open WebSocket connection.
+    Execute a single `(symbol, interval)` scrape on an already-connected WebSocket `ws`.
 
-    Returns `(status, error_reason, remaining_ws_buffer, bars, study_events, quote_data, resolved_meta)`.
-    `status` is one of:
-    - `"OK"`
-    - `"SYMBOL_ERROR"`
-    - `"AUTH_ERROR"`
-    - `"NETWORK_ERROR"`
+    Returns:
+        `(status, error_reason, updated_ws_buffer, bars_dict, raw_events, resolved_meta)`
+        where `status` is one of:
+        - `"OK"`: Completed normally
+        - `"SYMBOL_ERROR"`: Definitive TradingView symbol/series error (do not retry)
+        - `"AUTH_ERROR"`: JWT expired or rejected (`critical_error` / auth error)
+        - `"NETWORK_ERROR"`: Socket closed or timed out (reconnect and retry)
     """
     symbol = task.symbol
     interval = task.interval
     is_1d = interval == "1D"
+    is_futures = task.is_futures or symbol.endswith("1!") or symbol.endswith("2!")
 
-    chart_session = generate_session("cs")
-    quote_session = generate_session("qs") if is_1d else None
-    sym_id = "sds_sym_1"
+    chart_session = generate_session_id("cs")
+    quote_session = generate_session_id("qs") if (is_1d and not is_futures) else None
     series_id = "sds_1"
+    sym_id = "sds_sym_1"
 
-    ws.send(create_ws_message("chart_create_session", [chart_session, ""]))
-    ws.send(create_ws_message("switch_timezone", [chart_session, "Etc/UTC"]))
-
+    # 1. Quote session for fast stock splits on 1D (`quote_set_fields` uses flat args!)
     if is_1d and quote_session:
         ws.send(create_ws_message("quote_create_session", [quote_session]))
         ws.send(
             create_ws_message(
                 "quote_set_fields",
-                [quote_session, "base_name", "short_name", "last_splits"],
+                [quote_session, "base_name", "last_splits"],
             )
         )
         ws.send(create_ws_message("quote_add_symbols", [quote_session, symbol]))
-        ws.send(create_ws_message("quote_fast_symbols", [quote_session, symbol]))
 
-    # Request rawest nominal unadjusted bars via adjustment="none"
-    resolve_Config = json.dumps({"symbol": symbol, "adjustment": "none"})
+    # 2. Chart session for unadjusted OHLCV bars & event studies
+    ws.send(create_ws_message("chart_create_session", [chart_session, ""]))
+    resolve_config = json.dumps({"symbol": symbol, "adjustment": "none"})
     ws.send(
         create_ws_message(
             "resolve_symbol",
-            [chart_session, sym_id, f"={resolve_Config}"],
+            [chart_session, sym_id, f"={resolve_config}"],
         )
     )
     ws.send(
@@ -151,40 +159,60 @@ def _execute_task_on_ws(
         )
     )
 
-    study_col_map: dict[str, str] = {}
+    # 3. Add Event Studies on 1D probe (matching `run_first/worker_pool.py`)
+    required_studies: set[str] = set()
+    completed_studies: set[str] = set()
+
+    div_script = ctx.study_scripts.get("dividends", DEFAULT_STUDY_SCRIPTS["dividends"])
+    earn_script = ctx.study_scripts.get("earnings", DEFAULT_STUDY_SCRIPTS["earnings"])
+    roll_script = ctx.study_scripts.get("rolls", DEFAULT_STUDY_SCRIPTS["rolls"])
+
     if is_1d:
-        for idx_st, (st_id, st_script, col_name) in enumerate(ctx.study_descriptors):
-            study_col_map[st_id] = col_name
+        if not is_futures:
             ws.send(
                 create_ws_message(
                     "create_study",
-                    [
-                        chart_session,
-                        st_id,
-                        f"st{idx_st}",
-                        series_id,
-                        st_script,
-                        {"currenttime": "now"},
-                    ],
+                    [chart_session, "st_div", "st1", series_id, div_script, {}],
                 )
             )
+            ws.send(
+                create_ws_message(
+                    "create_study",
+                    [chart_session, "st_earn", "st1", series_id, earn_script, {}],
+                )
+            )
+            required_studies.update(["st_div", "st_earn"])
+        else:
+            ws.send(
+                create_ws_message(
+                    "create_study",
+                    [chart_session, "st_roll_a", "st1", series_id, roll_script, {"currenttime": "now"}],
+                )
+            )
+            ws.send(
+                create_ws_message(
+                    "create_study",
+                    [chart_session, "st_roll_b", "st2", series_id, roll_script, {}],
+                )
+            )
+            required_studies.update(["st_roll_a", "st_roll_b"])
 
     bars: dict[float, list[Any]] = {}
-    study_events: dict[str, list[dict[str, Any]]] = {
-        col: [] for _, _, col in ctx.study_descriptors
+    raw_events: dict[str, list[Any]] = {
+        "splits": [],
+        "dividends": [],
+        "earnings": [],
+        "rolls": [],
     }
-    quote_data: dict[str, Any] = {}
     resolved_meta: dict[str, bool] = {}
 
-    completed_studies = 0
-    total_studies = len(ctx.study_descriptors) if is_1d else 0
     main_series_completed = False
     prev_bar_count = 0
     history_batches = 0
 
     status = "OK"
     error_reason = ""
-    last_Wait = time.time()
+    last_wait = time.time()
 
     while True:
         if ctx.abort_event.is_set() or ctx.auth_failed_event.is_set():
@@ -192,13 +220,22 @@ def _execute_task_on_ws(
             error_reason = "Aborted"
             break
 
-        if time.time() - last_Wait > 25.0:
-            status = "NETWORK_ERROR"
-            error_reason = "Recv timeout (>25s)"
+        if time.time() - last_wait > 25.0:
+            if bars and main_series_completed:
+                # Series already completed; don't discard valid bars if a study timed out
+                status = "OK"
+            else:
+                status = "NETWORK_ERROR"
+                error_reason = "Recv timeout (>25s)"
             break
 
         try:
+            ws.settimeout(3.0)
             raw_msg = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            if main_series_completed and (not is_1d or required_studies.issubset(completed_studies)):
+                break
+            continue
         except Exception as exc:
             status = "NETWORK_ERROR"
             error_reason = f"Socket recv error: {exc}"
@@ -209,7 +246,7 @@ def _execute_task_on_ws(
             error_reason = "Socket closed by remote"
             break
 
-        last_Wait = time.time()
+        last_wait = time.time()
         ws_buffer += raw_msg
         messages, ws_buffer = parse_ws_messages(ws_buffer)
 
@@ -228,20 +265,41 @@ def _execute_task_on_ws(
             m_type = data.get("m")
             params = data.get("p", [])
 
-            if m_type == "qsd" and is_1d and len(params) >= 2 and isinstance(params[1], dict):
+            # Capture Quote Session splits (`params[0] == quote_session`)
+            if (
+                m_type == "qsd"
+                and is_1d
+                and quote_session
+                and len(params) >= 2
+                and params[0] == quote_session
+                and isinstance(params[1], dict)
+            ):
                 v_dict = params[1].get("v", {})
-                if "last_splits" in v_dict:
-                    quote_data["last_splits"] = v_dict["last_splits"]
+                if "last_splits" in v_dict and isinstance(v_dict["last_splits"], list):
+                    raw_events["splits"] = v_dict["last_splits"]
 
-            elif m_type == "symbol_resolved" and len(params) >= 2:
-                meta = params[2] if len(params) >= 3 and isinstance(params[2], dict) else (
-                    params[1] if isinstance(params[1], dict) else {}
+            # Capture Symbol Info (`params[0] == chart_session`)
+            elif (
+                m_type == "symbol_resolved"
+                and len(params) >= 2
+                and params[0] == chart_session
+            ):
+                meta = (
+                    params[2]
+                    if len(params) >= 3 and isinstance(params[2], dict)
+                    else (params[1] if isinstance(params[1], dict) else {})
                 )
                 if isinstance(meta, dict):
-                    resolved_meta["has_intraday"] = bool(meta.get("has_intraday", False))
+                    resolved_meta["has_intraday"] = bool(meta.get("has_intraday", True))
                     resolved_meta["has_adjustment"] = bool(meta.get("has_adjustment", False))
 
-            elif m_type in ("timescale_update", "du") and len(params) >= 2 and isinstance(params[1], dict):
+            # Capture Bars and Studies (`params[0] == chart_session`)
+            elif (
+                m_type in ("timescale_update", "du")
+                and len(params) >= 2
+                and params[0] == chart_session
+                and isinstance(params[1], dict)
+            ):
                 payload_dict = params[1]
                 if series_id in payload_dict:
                     s_list = payload_dict[series_id].get("s", [])
@@ -257,18 +315,27 @@ def _execute_task_on_ws(
                                 v[5] if len(v) > 5 else 0.0,
                             ]
                 if is_1d:
-                    for st_id, col_name in study_col_map.items():
-                        if st_id in payload_dict:
-                            st_items = (
-                                payload_dict[st_id].get("st", [])
-                                or payload_dict[st_id].get("s", [])
-                            )
-                            if st_items:
-                                study_events[col_name].extend(st_items)
+                    if "st_div" in payload_dict:
+                        st = payload_dict["st_div"].get("st", [])
+                        if st:
+                            raw_events["dividends"].extend(st)
+                    if "st_earn" in payload_dict:
+                        st = payload_dict["st_earn"].get("st", [])
+                        if st:
+                            raw_events["earnings"].extend(st)
+                    for roll_key in ("st_roll_a", "st_roll_b"):
+                        if roll_key in payload_dict:
+                            st = payload_dict[roll_key].get("st", [])
+                            if st:
+                                raw_events["rolls"].extend(st)
 
-            elif m_type == "series_completed":
+            elif (
+                m_type == "series_completed"
+                and len(params) >= 1
+                and params[0] == chart_session
+            ):
                 current_count = len(bars)
-                if ctx.fetch_full_history:
+                if ctx.fetch_full_history and not is_1d:
                     if (
                         current_count > prev_bar_count
                         and current_count > 0
@@ -285,32 +352,35 @@ def _execute_task_on_ws(
                     else:
                         main_series_completed = True
                 else:
-                    # Phase 2 (Weekly): single batch of recent bars
+                    # 1D initial load (2,000,000 bars covers all 1D history in 1 batch) or Weekly Phase 2
                     main_series_completed = True
 
-                if main_series_completed and (not is_1d or completed_studies >= total_studies):
+                if main_series_completed and (not is_1d or required_studies.issubset(completed_studies)):
                     done_loop = True
                     break
 
-            elif m_type == "study_completed" and is_1d:
-                completed_studies += 1
-                if main_series_completed and completed_studies >= total_studies:
+            elif (
+                m_type in ("study_completed", "study_error")
+                and is_1d
+                and len(params) >= 2
+                and params[0] == chart_session
+            ):
+                completed_studies.add(str(params[1]))
+                if main_series_completed and required_studies.issubset(completed_studies):
                     done_loop = True
                     break
 
-            elif m_type == "study_error" and is_1d:
-                completed_studies += 1
-                if main_series_completed and completed_studies >= total_studies:
-                    done_loop = True
-                    break
-
-            elif m_type in ("symbol_error", "series_error"):
+            elif (
+                m_type in ("symbol_error", "series_error")
+                and len(params) >= 1
+                and params[0] == chart_session
+            ):
                 status = "SYMBOL_ERROR"
-                error_reason = str(params)
+                error_reason = f"{m_type}: {params}"
                 done_loop = True
                 break
 
-            elif m_type == "critical_error":
+            elif m_type in ("critical_error", "error"):
                 err_str = str(params).lower()
                 if "auth" in err_str or "token" in err_str or "permission" in err_str:
                     status = "AUTH_ERROR"
@@ -332,7 +402,36 @@ def _execute_task_on_ws(
         except Exception:
             pass
 
-    return status, error_reason, ws_buffer, bars, study_events, quote_data, resolved_meta
+    return status, error_reason, ws_buffer, bars, raw_events, resolved_meta
+
+
+def _bars_to_dataframe_with_events(
+    symbol: str,
+    interval: str,
+    bars: dict[float, list[Any]],
+    raw_events: dict[str, Any] | None,
+) -> pd.DataFrame:
+    """
+    Convert `bars` dictionary into a sorted DataFrame and attach corporate action
+    and roll events (`raw_split`, `raw_dividend`, `raw_earnings`, `raw_roll`) via
+    `attach_events_to_df`.
+    """
+    if not bars:
+        return pd.DataFrame()
+    sorted_rows = [bars[ts] for ts in sorted(bars.keys())]
+    arr = np.array(sorted_rows, dtype=np.float64)
+    df = pd.DataFrame(
+        {
+            "symbol": symbol,
+            "time": arr[:, 0].astype(np.int64),
+            "open": arr[:, 1],
+            "high": arr[:, 2],
+            "low": arr[:, 3],
+            "close": arr[:, 4],
+            "volume": arr[:, 5] if arr.shape[1] >= 6 else np.zeros(arr.shape[0], dtype=np.float64),
+        }
+    )
+    return attach_events_to_df(df=df, raw_events=raw_events, interval=interval)
 
 
 def _worker_thread_loop(
@@ -365,7 +464,6 @@ def _worker_thread_loop(
         picked_queue: queue.Queue[TaskItem | None] | None = None
 
         if is_ultimate_worker:
-            # Prioritize intraday_queue, but assist on primary_queue if intraday_queue is empty
             try:
                 task = ctx.intraday_queue.get_nowait()
                 picked_queue = ctx.intraday_queue
@@ -388,7 +486,8 @@ def _worker_thread_loop(
             break
 
         try:
-            # Ensure active WebSocket connection with a valid authenticated JWT
+            time.sleep(random.uniform(0.02, 0.05))
+
             if ws is None:
                 try:
                     jwt_tok = (
@@ -436,8 +535,7 @@ def _worker_thread_loop(
                 error_reason,
                 ws_buffer,
                 bars,
-                study_events,
-                quote_data,
+                raw_events,
                 resolved_meta,
             ) = _execute_task_on_ws(ws, ws_buffer, task, ctx)
 
@@ -490,43 +588,31 @@ def _worker_thread_loop(
 
             # status == "OK"
             if task.interval == "1D":
-                merge_events_to_1d(bars, study_events, quote_data)
-
-            with ctx.results_lock:
-                if task.interval == "1D":
+                with ctx.results_lock:
+                    ctx.symbol_events[task.symbol] = raw_events
                     ctx.symbol_metadata[task.symbol] = {
-                        "has_intraday": bool(resolved_meta.get("has_intraday", False)),
+                        "has_intraday": bool(resolved_meta.get("has_intraday", True)),
                         "has_adjustment": bool(resolved_meta.get("has_adjustment", False)),
                         "symbol_error": False,
                     }
-                if bars:
-                    target_list = ctx.chunk_bars.setdefault(task.interval, [])
-                    for ts in sorted(bars.keys()):
-                        b = bars[ts]
-                        if task.interval == "1D":
-                            target_list.append(
-                                [
-                                    task.symbol,
-                                    b[0],
-                                    b[1],
-                                    b[2],
-                                    b[3],
-                                    b[4],
-                                    b[5],
-                                    b[6],
-                                    b[7],
-                                    b[8],
-                                    b[9],
-                                    b[10],
-                                ]
-                            )
-                        else:
-                            target_list.append(
-                                [task.symbol, b[0], b[1], b[2], b[3], b[4], b[5]]
-                            )
+                events_for_sym = raw_events
+            else:
+                with ctx.results_lock:
+                    events_for_sym = ctx.symbol_events.get(task.symbol)
+
+            if bars:
+                df_sym = _bars_to_dataframe_with_events(
+                    symbol=task.symbol,
+                    interval=task.interval,
+                    bars=bars,
+                    raw_events=events_for_sym,
+                )
+                with ctx.results_lock:
+                    ctx.chunk_dfs.setdefault(task.interval, []).append(df_sym)
                     ctx.success_logs.append((task.symbol, task.interval, "OK"))
-                else:
-                    ctx.failure_logs.append((task.symbol, task.interval, "No bars returned"))
+            else:
+                with ctx.results_lock:
+                    ctx.failure_logs.append((task.symbol, task.interval, "series_completed_but_empty"))
 
         finally:
             if picked_queue is not None:
@@ -577,13 +663,11 @@ def run_task_batch_with_retries(
                 )
                 t.start()
                 threads.append(t)
-            # Enqueue poison pills so workers exit cleanly once queues drain
             for _ in range(ultimate_workers):
                 ctx.intraday_queue.put(None)
             for _ in range(total_workers):
                 ctx.primary_queue.put(None)
         else:
-            # All 8 workers run on the Free account pool servicing primary_queue
             for i in range(total_workers):
                 t = threading.Thread(
                     target=_worker_thread_loop,
@@ -598,7 +682,6 @@ def run_task_batch_with_retries(
         for t in threads:
             t.join()
 
-        # Drain any leftover None sentinels
         while not ctx.primary_queue.empty():
             try:
                 ctx.primary_queue.get_nowait()
@@ -622,4 +705,3 @@ def run_task_batch_with_retries(
             time.sleep(2.0)
         else:
             break
-

@@ -1,55 +1,67 @@
 """
-TradingView WebSocket framing, dynamic study version discovery, Ultimate tier
-verification, and 1D corporate-action event merging.
+TradingView WebSocket protocol framing, account tier probing, dynamic study
+metadata resolution, and vectorized corporate-action / roll attachment
+(`attach_events_to_df`) across all intervals (`1D`, `1W`, `1M`, and intraday).
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import random
 import re
+import ssl
 import string
 import time
 from typing import Any
 
+import numpy as np
+import pandas as pd
 import requests
 import websocket
 
 
-def generate_session(prefix: str) -> str:
-    """Generate a random TradingView session identifier (e.g. `cs_xxxxxxxxxxxx`)."""
-    chars = string.ascii_lowercase + string.digits
-    return f"{prefix}_" + "".join(random.choice(chars) for _ in range(12))
+def generate_session_id(prefix: str = "cs") -> str:
+    """Generate a random 12-char TradingView session identifier."""
+    rand_part = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    return f"{prefix}_{rand_part}"
 
 
 def create_ws_message(func: str, param_list: list[Any]) -> str:
-    """Format a TradingView Socket.IO WebSocket frame `~m~{len}~m~{json}`."""
+    """Format a TradingView Socket.IO ~m~ framed JSON message."""
     payload = json.dumps({"m": func, "p": param_list}, separators=(",", ":"))
     return f"~m~{len(payload)}~m~{payload}"
 
 
 def parse_ws_messages(buffer: str) -> tuple[list[str], str]:
     """
-    Parse all complete `~m~{length}~m~{payload}` frames from `buffer`.
-    Returns `(messages, remaining_unparsed_buffer)`.
+    Stream-parse complete `~m~<len>~m~<payload>` frames from `buffer`.
+    Returns `(complete_messages, remaining_unparsed_buffer)`.
     """
     messages: list[str] = []
-    while buffer.startswith("~m~"):
-        end_len_idx = buffer.find("~m~", 3)
+    idx = 0
+    n = len(buffer)
+    while idx < n:
+        if not buffer.startswith("~m~", idx):
+            next_marker = buffer.find("~m~", idx)
+            if next_marker == -1:
+                return messages, ""
+            idx = next_marker
+        end_len_idx = buffer.find("~m~", idx + 3)
         if end_len_idx == -1:
             break
+        len_str = buffer[idx + 3 : end_len_idx]
         try:
-            length = int(buffer[3:end_len_idx])
+            msg_len = int(len_str)
         except ValueError:
-            buffer = buffer[end_len_idx + 3 :]
+            idx = end_len_idx + 3
             continue
         start_msg = end_len_idx + 3
-        if len(buffer) < start_msg + length:
+        end_msg = start_msg + msg_len
+        if end_msg > n:
             break
-        messages.append(buffer[start_msg : start_msg + length])
-        buffer = buffer[start_msg + length :]
-    return messages, buffer
+        messages.append(buffer[start_msg:end_msg])
+        idx = end_msg
+    return messages, buffer[idx:]
 
 
 def verify_cookie_tier(
@@ -88,21 +100,20 @@ def verify_cookie_tier(
         return False, None, "Free"
 
 
-DEFAULT_STUDY_DESCRIPTORS: list[tuple[str, str, str]] = [
-    ("st_splits", "Splits@tv-basicstudies-281", "raw_split"),
-    ("st_divs", "Dividends@tv-basicstudies-281", "raw_dividend"),
-    ("st_earns", "Earnings@tv-basicstudies-281", "raw_earnings"),
-    ("st_rolls", "BarSetContinuousRollDates@tv-corestudies-50", "raw_roll"),
-]
+DEFAULT_STUDY_SCRIPTS: dict[str, str] = {
+    "dividends": "Dividends@tv-basicstudies-281",
+    "earnings": "Earnings@tv-basicstudies-281",
+    "rolls": "BarSetContinuousRollDates@tv-corestudies-50",
+}
 
 
-def resolve_live_study_descriptors(jwt_token: str) -> list[tuple[str, str, str]]:
+def resolve_live_study_descriptors(jwt_token: str) -> dict[str, str]:
     """
     Query TradingView's live `request_studies_metadata` endpoint once at startup
-    to resolve the latest study version numbers for Splits, Dividends, Earnings,
-    and Continuous Roll Dates. Falls back to `DEFAULT_STUDY_DESCRIPTORS` on timeout.
+    to resolve the latest study version numbers for Dividends, Earnings, and
+    Continuous Roll Dates. Falls back to `DEFAULT_STUDY_SCRIPTS` on timeout.
     """
-    descriptors = list(DEFAULT_STUDY_DESCRIPTORS)
+    scripts = dict(DEFAULT_STUDY_SCRIPTS)
     ws = None
     try:
         ws = websocket.create_connection(
@@ -111,16 +122,16 @@ def resolve_live_study_descriptors(jwt_token: str) -> list[tuple[str, str, str]]
                 "Origin: https://www.tradingview.com",
                 "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             ],
+            sslopt={"cert_reqs": ssl.CERT_NONE},
             timeout=15,
         )
         ws.send(create_ws_message("set_auth_token", [jwt_token]))
         ws.send(create_ws_message("request_studies_metadata", ["st_meta_req"]))
 
-        targets: dict[str, tuple[str, str]] = {
-            "Splits@tv-basicstudies-": ("st_splits", "raw_split"),
-            "Dividends@tv-basicstudies-": ("st_divs", "raw_dividend"),
-            "Earnings@tv-basicstudies-": ("st_earns", "raw_earnings"),
-            "BarSetContinuousRollDates@tv-corestudies-": ("st_rolls", "raw_roll"),
+        targets: dict[str, str] = {
+            "Dividends@tv-basicstudies-": "dividends",
+            "Earnings@tv-basicstudies-": "earnings",
+            "BarSetContinuousRollDates@tv-corestudies-": "rolls",
         }
         best_versions: dict[str, tuple[int, str]] = {}
         buf = ""
@@ -147,30 +158,26 @@ def resolve_live_study_descriptors(jwt_token: str) -> list[tuple[str, str, str]]
                         sid = item.get("id", "").rstrip("!")
                         if "PriceSupport" in sid:
                             continue
-                        for prefix in targets:
+                        for prefix, key_name in targets.items():
                             if sid.startswith(prefix):
                                 ver_str = sid.replace(prefix, "")
                                 try:
                                     ver = int(ver_str)
                                 except ValueError:
                                     ver = 0
-                                if prefix not in best_versions or ver >= best_versions[prefix][0]:
-                                    best_versions[prefix] = (ver, sid)
+                                if key_name not in best_versions or ver >= best_versions[key_name][0]:
+                                    best_versions[key_name] = (ver, sid)
                     done = True
                     break
 
         if best_versions:
-            resolved: list[tuple[str, str, str]] = []
-            for idx, (prefix, (st_id, col_name)) in enumerate(targets.items()):
-                if prefix in best_versions:
-                    resolved.append((st_id, best_versions[prefix][1], col_name))
-                else:
-                    resolved.append(descriptors[idx])
+            for key_name, (_, sid) in best_versions.items():
+                scripts[key_name] = sid
             print(
-                f"[Protocol] Dynamically resolved study versions: {[d[1] for d in resolved]}",
+                f"[Protocol] Dynamically resolved study versions: {scripts}",
                 flush=True,
             )
-            return resolved
+            return scripts
     except Exception as exc:
         print(
             f"[Protocol] Dynamic study metadata lookup fallback to defaults ({exc})",
@@ -182,68 +189,106 @@ def resolve_live_study_descriptors(jwt_token: str) -> list[tuple[str, str, str]]
                 ws.close()
             except Exception:
                 pass
-    return descriptors
+    return scripts
 
 
-def merge_events_to_1d(
-    bars: dict[float, list[Any]],
-    study_events: dict[str, list[dict[str, Any]]],
-    quote_data: dict[str, Any],
-) -> None:
+def attach_events_to_df(
+    df: pd.DataFrame,
+    raw_events: dict[str, Any] | None,
+    interval: str = "1D",
+) -> pd.DataFrame:
     """
-    Attach raw corporate-action and roll study payloads (`raw_split`,
-    `raw_dividend`, `raw_earnings`, `raw_roll`, `last_splits`) onto the matching
-    `1D` bar in `bars`.
-
-    In TradingView's study response (`data[st_id]["st"]`), each item has
-    `"v": [bar_ts, ...]`, where `v[0]` is the exact `1D` bar unix timestamp.
+    Attach corporate events (`splits`, `dividends`, `earnings`, continuous `rolls`)
+    to candlestick bars for ANY interval (`1D`, `1W`, `1M`, or intraday).
+    Matches the exact logic from `run_first/event_engine.py` and `run_weekly/merge_engine.py`.
     """
-    if not bars:
-        return
-    sorted_ts = sorted(bars.keys())
-    col_idx_map = {
-        "raw_split": 6,
-        "raw_dividend": 7,
-        "raw_earnings": 8,
-        "raw_roll": 9,
-    }
-    date_to_ts: dict[str, float] = {}
-    for ts in sorted_ts:
-        while len(bars[ts]) < 11:
-            bars[ts].append(None)
-        d_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
-        date_to_ts[d_str] = ts
+    if df.empty:
+        return df
 
-    # 1. Map splits from quote_data["last_splits"] by UTC date if present
-    last_splits = quote_data.get("last_splits", [])
-    if isinstance(last_splits, list) and last_splits:
-        for sp_item in last_splits:
-            if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2:
-                try:
-                    d_str = datetime.fromtimestamp(int(sp_item[0]), tz=timezone.utc).strftime("%Y-%m-%d")
-                    if d_str in date_to_ts:
-                        bars[date_to_ts[d_str]][6] = json.dumps(sp_item)
-                except Exception:
-                    pass
-        if sorted_ts:
-            bars[sorted_ts[-1]][10] = json.dumps(last_splits)
+    if "raw_split" not in df.columns:
+        df["raw_split"] = np.nan
+    if "raw_dividend" not in df.columns:
+        df["raw_dividend"] = None
+    if "raw_earnings" not in df.columns:
+        df["raw_earnings"] = None
+    if "raw_roll" not in df.columns:
+        df["raw_roll"] = None
 
-    # 2. Map study events (`st` items where v[0] is bar timestamp)
-    for col_name, events in study_events.items():
-        if not events:
-            continue
-        c_idx = col_idx_map[col_name]
-        for ev in events:
-            v = ev.get("v", [])
-            if not v or v[0] is None:
-                continue
-            ev_ts = float(v[0])
-            matched_ts = None
-            if ev_ts in bars:
-                matched_ts = ev_ts
-            else:
-                ev_d = datetime.fromtimestamp(int(ev_ts), tz=timezone.utc).strftime("%Y-%m-%d")
-                if ev_d in date_to_ts:
-                    matched_ts = date_to_ts[ev_d]
-            if matched_ts is not None:
-                bars[matched_ts][c_idx] = json.dumps(v)
+    if not raw_events:
+        return df
+
+    times = df["time"].values
+    n_times = len(times)
+    if n_times == 0:
+        return df
+
+    max_delta = 8 * 86400 if interval == "1W" else (35 * 86400 if interval == "1M" else 86400)
+
+    def find_target_idx(event_ts_sec: float) -> int | None:
+        if interval in ("1D", "1", "5", "15", "60", "240"):
+            # Day-aligned match: Find first candle on or after start of UTC day
+            start_of_day = (int(event_ts_sec) // 86400) * 86400
+            end_of_day = start_of_day + 86400
+            idx = int(np.searchsorted(times, start_of_day))
+            if idx < n_times and times[idx] < end_of_day:
+                return idx
+            return None
+        else:
+            # Macro (1W, 1M): Find the candle that opened on or before event timestamp
+            cand_idx = int(np.searchsorted(times, event_ts_sec, side="right")) - 1
+            if 0 <= cand_idx < n_times and (event_ts_sec - times[cand_idx]) <= max_delta:
+                return cand_idx
+            return None
+
+    # 1. Splits from Quote `last_splits`: item = [ts_sec, split_factor]
+    for sp in raw_events.get("splits", []):
+        if isinstance(sp, (list, tuple)) and len(sp) >= 2:
+            try:
+                sp_ts, sp_factor = float(sp[0]), float(sp[1])
+                idx = find_target_idx(sp_ts)
+                if idx is not None:
+                    df.iat[idx, df.columns.get_loc("raw_split")] = sp_factor
+            except Exception:
+                pass
+
+    # 2. Dividends: v = [bar_ts, gross_payout, ex_date_ms, adjusted_payout, payment_date_ms]
+    for d in raw_events.get("dividends", []):
+        v = d.get("v", []) if isinstance(d, dict) else []
+        if len(v) >= 3 and v[2]:
+            try:
+                ex_ts = float(v[2]) / 1000.0
+                idx = find_target_idx(ex_ts)
+                if idx is None and v[0] and float(v[0]) > 100000:
+                    idx = find_target_idx(float(v[0]))
+                if idx is not None:
+                    df.iat[idx, df.columns.get_loc("raw_dividend")] = tuple(v)
+            except Exception:
+                pass
+
+    # 3. Earnings: v = [bar_ts, std_eps, est_eps, period_s, ann_ms, rep_eps, rev_est_M, rev_act_M, flags]
+    for e in raw_events.get("earnings", []):
+        v = e.get("v", []) if isinstance(e, dict) else []
+        if len(v) >= 5 and v[4]:
+            try:
+                ann_ts = float(v[4]) / 1000.0
+                idx = find_target_idx(ann_ts)
+                if idx is None and v[0] and float(v[0]) > 100000:
+                    idx = find_target_idx(float(v[0]))
+                if idx is not None:
+                    df.iat[idx, df.columns.get_loc("raw_earnings")] = tuple(v)
+            except Exception:
+                pass
+
+    # 4. Continuous Rolls: v = [bar_ts, from_code, to_code, switch_date_yyyymmdd]
+    for r in raw_events.get("rolls", []):
+        v = r.get("v", []) if isinstance(r, dict) else []
+        if len(v) >= 4 and v[0] is not None:
+            try:
+                roll_ts = float(v[0])
+                idx = find_target_idx(roll_ts)
+                if idx is not None:
+                    df.iat[idx, df.columns.get_loc("raw_roll")] = tuple(v[:4])
+            except Exception:
+                pass
+
+    return df

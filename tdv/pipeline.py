@@ -3,17 +3,18 @@ Core Two-Stage, Chunk-Based Execution Pipeline shared by Phase 1 (Initial Full S
 and Phase 2 (Weekly Maintenance).
 
 Stage 1 (per 2,000-symbol chunk):
-  - Scrape `1D` bars + dynamic corporate action & roll studies (`Splits`, `Dividends`,
-    `Earnings`, `RollDates`, `last_splits`) using full `EXCHANGE:SYMBOL` tickers
-    (and expanded futures `contracts`).
+  - Scrape `1D` bars + corporate action & roll studies (`last_splits` via Quote
+    session, `Dividends` & `Earnings` studies for non-futures, `BarSetContinuousRollDates`
+    for futures) using full `EXCHANGE:SYMBOL` tickers (and expanded futures `contracts`).
   - Record `has_intraday` and `has_adjustment` from `symbol_resolved`.
-  - Overwrite-merge and encrypt `1D` chunk.
 
 Stage 2 (per 2,000-symbol chunk):
   - Queue `1W` and `1M` for all valid symbols.
   - Queue intraday intervals (`1`, `5`, `15`, `60`, `240`) ONLY for symbols where
     Stage 1 reported `has_intraday == True`. Log daily-only symbols in `checkpoint.log`
     as `{timestamp}, {sym}, INTRADAY, skipped, has_intraday is False`.
+  - Attach corporate actions (`raw_split`, `raw_dividend`, `raw_earnings`, `raw_roll`)
+    to all intervals via `attach_events_to_df`.
   - Overwrite-merge and encrypt each interval's `.parquet.enc` chunk.
   - Log every saved symbol with its bar count and full bucket chunk path in
     `checkpoint.log`:
@@ -24,6 +25,7 @@ Stage 2 (per 2,000-symbol chunk):
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
@@ -58,7 +60,7 @@ from tdv.map_planner import ChunkAssignment, expand_node_assignments
 from tdv.protocol import resolve_live_study_descriptors, verify_cookie_tier
 from tdv.worker import ChunkExecutionContext, TaskItem, run_task_batch_with_retries
 
-COLUMNS_1D = [
+COLUMNS_EVENT = [
     "symbol",
     "time",
     "open",
@@ -70,8 +72,8 @@ COLUMNS_1D = [
     "raw_dividend",
     "raw_earnings",
     "raw_roll",
-    "last_splits",
 ]
+COLUMNS_LEGACY_12 = COLUMNS_EVENT + ["last_splits"]
 COLUMNS_STANDARD = ["symbol", "time", "open", "high", "low", "close", "volume"]
 
 
@@ -108,16 +110,27 @@ def _merge_and_encrypt_interval_chunk(
     exchange: str,
     interval: str,
     chunk_idx: int,
-    new_rows: list[list[Any]],
+    new_rows: list[Any],
     fernet_key: bytes,
 ) -> tuple[bytes, dict[str, int]]:
     """
     Download existing `.parquet.enc` chunk from the bucket (if present), merge
-    `new_rows` deduplicated by `["symbol", "time"]` (`keep="last"`), sort by
+    `new_rows` (either a list of `pd.DataFrame`s or a list of row lists)
+    deduplicated by `["symbol", "time"]` (`keep="last"`), sort by
     `["symbol", "time"]`, and return `(encrypted_parquet_bytes, new_symbol_bar_counts)`.
     """
-    cols = COLUMNS_1D if interval == STAGE1_INTERVAL else COLUMNS_STANDARD
-    new_df = pd.DataFrame(new_rows, columns=cols)
+    if new_rows and isinstance(new_rows[0], pd.DataFrame):
+        new_df = pd.concat(new_rows, ignore_index=True)
+    else:
+        row_len = len(new_rows[0]) if new_rows else 7
+        if row_len == 12:
+            cols = COLUMNS_LEGACY_12
+        elif row_len == 11:
+            cols = COLUMNS_EVENT
+        else:
+            cols = COLUMNS_STANDARD
+        new_df = pd.DataFrame(new_rows, columns=cols)
+
     new_symbol_counts = {str(k): int(v) for k, v in new_df["symbol"].value_counts().to_dict().items()}
 
     existing_df, exists_on_bucket = bucket.download_encrypted_chunk(
@@ -212,7 +225,7 @@ def run_node_pipeline(
         )
 
     # 3. Dynamically resolve latest TradingView study versions
-    study_descriptors = resolve_live_study_descriptors(initial_jwt)
+    study_scripts = resolve_live_study_descriptors(initial_jwt)
 
     # 4. Load map.json assignments for this node
     if not resolved_map_path.exists():
@@ -281,6 +294,7 @@ def run_node_pipeline(
         exchange = chunk.exchange
         chunk_idx = chunk.chunk_idx
         chunk_syms = chunk.symbols
+        is_futures_exchange = "FUTURES" in exchange.upper()
 
         # Quick check if every (symbol, interval) in this chunk is already recorded
         all_done = all(
@@ -304,7 +318,7 @@ def run_node_pipeline(
 
         ctx = ChunkExecutionContext(
             fetch_full_history=fetch_full_history,
-            study_descriptors=study_descriptors,
+            study_scripts=study_scripts,
             jwt_manager=jwt_manager,
             has_ultimate=has_ultimate,
             ultimate_jwt=ultimate_jwt,
@@ -322,7 +336,11 @@ def run_node_pipeline(
         # STAGE 1: 1D Discovery + Corporate Action Studies
         # -------------------------------------------------------------------
         tasks_1d = [
-            TaskItem(symbol=sym, interval=STAGE1_INTERVAL)
+            TaskItem(
+                symbol=sym,
+                interval=STAGE1_INTERVAL,
+                is_futures=(is_futures_exchange or sym.endswith("1!") or sym.endswith("2!")),
+            )
             for sym in chunk_syms
             if (sym, STAGE1_INTERVAL) not in completed_pairs
         ]
@@ -358,17 +376,23 @@ def run_node_pipeline(
             if meta.get("symbol_error", False):
                 continue
 
+            sym_is_futures = is_futures_exchange or sym.endswith("1!") or sym.endswith("2!")
+
             # Queue 1W and 1M
             for macro_iv in STAGE2_MACRO_INTERVALS:
                 if (sym, macro_iv) not in completed_pairs:
-                    tasks_stage2.append(TaskItem(symbol=sym, interval=macro_iv))
+                    tasks_stage2.append(
+                        TaskItem(symbol=sym, interval=macro_iv, is_futures=sym_is_futures)
+                    )
 
             # Queue Intraday ONLY when has_intraday is True
             has_intraday = bool(meta.get("has_intraday", known_intraday.get(sym, False)))
             if has_intraday:
                 for intra_iv in INTRADAY_INTERVALS:
                     if (sym, intra_iv) not in completed_pairs:
-                        tasks_stage2.append(TaskItem(symbol=sym, interval=intra_iv))
+                        tasks_stage2.append(
+                            TaskItem(symbol=sym, interval=intra_iv, is_futures=sym_is_futures)
+                        )
             else:
                 if any((sym, intra_iv) not in completed_pairs for intra_iv in INTRADAY_INTERVALS):
                     intraday_skipped_syms.append(sym)
@@ -407,17 +431,20 @@ def run_node_pipeline(
         checkpoint_lines: list[str] = []
 
         for interval in ALL_INTERVALS:
-            rows = ctx.chunk_bars.get(interval, [])
-            if not rows:
+            dfs = ctx.chunk_dfs.pop(interval, [])
+            if not dfs:
                 continue
             enc_bytes, sym_counts = _merge_and_encrypt_interval_chunk(
                 bucket=bucket,
                 exchange=exchange,
                 interval=interval,
                 chunk_idx=chunk_idx,
-                new_rows=rows,
+                new_rows=dfs,
                 fernet_key=fernet_key,
             )
+            del dfs
+            gc.collect()
+
             remote_chunk_path = get_chunk_bucket_path(exchange, interval, chunk_idx)
             batch_uploads.append((enc_bytes, remote_chunk_path))
 
@@ -443,7 +470,7 @@ def run_node_pipeline(
             with local_failures.open("a", encoding="utf-8") as f_fl:
                 for sym, iv, reason in ctx.failure_logs:
                     clean_reason = reason.replace("\n", " ").replace("\r", " ").strip()
-                    f_fl.write(f"{now_ts}, {sym}, {iv}, tradingview_error, {clean_reason}\n")
+                    f_fl.write(f"{now_ts}, {sym}, {iv}, tradingview_message, {clean_reason}\n")
                     completed_pairs.add((sym, iv))
 
         batch_uploads.append((local_checkpoint.read_bytes(), remote_checkpoint_path))
