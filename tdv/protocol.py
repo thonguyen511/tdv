@@ -107,7 +107,7 @@ DEFAULT_STUDY_SCRIPTS: dict[str, str] = {
 }
 
 
-def resolve_live_study_descriptors(jwt_token: str, max_attempts: int = 3) -> dict[str, str]:
+def resolve_live_study_descriptors(jwt_token: str = "", max_attempts: int = 3) -> dict[str, str]:
     """
     Query TradingView's live `request_studies_metadata` endpoint at startup
     (with up to `max_attempts` retries) to dynamically resolve the latest study
@@ -134,27 +134,30 @@ def resolve_live_study_descriptors(jwt_token: str, max_attempts: int = 3) -> dic
                 timeout=15,
             )
             ws.recv()  # Initial handshake frame
-            ws.send(create_ws_message("set_auth_token", [jwt_token]))
+            ws.send(create_ws_message("set_auth_token", ["unauthorized_user_token"]))
             ws.send(create_ws_message("request_studies_metadata", ["st_meta_req"]))
 
             best_versions: dict[str, tuple[int, str]] = {}
-            buf = ""
             start = time.time()
             done = False
 
             while time.time() - start < 10.0 and not done:
+                ws.settimeout(6.0)
                 raw = ws.recv()
                 if not raw:
                     break
-                buf += raw
-                msgs, buf = parse_ws_messages(buf)
-                for msg in msgs:
-                    if msg.startswith("~h~"):
-                        ws.send(f"~m~{len(msg)}~m~{msg}")
+                for part in raw.split("~m~"):
+                    if not part or part.isdigit():
                         continue
-                    if not msg.startswith("{"):
+                    if part.startswith("~h~"):
+                        ws.send(f"~m~{len(part)}~m~{part}")
                         continue
-                    data = json.loads(msg)
+                    if not part.startswith("{"):
+                        continue
+                    try:
+                        data = json.loads(part)
+                    except Exception:
+                        continue
                     if data.get("m") == "studies_metadata":
                         params = data.get("p", [])
                         meta = params[1] if len(params) > 1 else params[0]
