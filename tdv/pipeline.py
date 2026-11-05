@@ -77,11 +77,15 @@ COLUMNS_LEGACY_12 = COLUMNS_EVENT + ["last_splits"]
 COLUMNS_STANDARD = ["symbol", "time", "open", "high", "low", "close", "volume"]
 
 
-def _parse_checkpoint_text(raw_text: str) -> tuple[set[tuple[str, str]], dict[str, bool]]:
+def _parse_checkpoint_text(
+    raw_text: str,
+    is_failure_log: bool = False,
+) -> tuple[set[tuple[str, str]], dict[str, bool], set[str]]:
     """
     Parse `checkpoint.log` (and `failures.log`) lines into:
     - `completed_pairs`: set of `(symbol, interval)` pairs already completed or skipped
     - `known_intraday`: dict mapping `symbol -> has_intraday` inferred from prior logs
+    - `failed_1d_symbols`: set of symbols that failed or returned empty on `1D`
 
     Supports the full log format:
     - `2026-11-03 12:00:00, NASDAQ:NVDA, 1D, checkpoint, Bars: 6988, data/NASDAQ/1D/NASDAQ_1D_chunk_6.parquet.enc`
@@ -89,6 +93,7 @@ def _parse_checkpoint_text(raw_text: str) -> tuple[set[tuple[str, str]], dict[st
     """
     completed_pairs: set[tuple[str, str]] = set()
     known_intraday: dict[str, bool] = {}
+    failed_1d_symbols: set[str] = set()
     for line in raw_text.splitlines():
         parts = [p.strip() for p in line.strip().split(",")]
         if len(parts) >= 3:
@@ -98,11 +103,17 @@ def _parse_checkpoint_text(raw_text: str) -> tuple[set[tuple[str, str]], dict[st
                 known_intraday[sym] = False
                 for intra_iv in INTRADAY_INTERVALS:
                     completed_pairs.add((sym, intra_iv))
+            elif (is_failure_log or status == "tradingview_message") and iv == STAGE1_INTERVAL:
+                # 1D failed or had 0 bars -> all intervals for this symbol are skipped in Stage 2
+                failed_1d_symbols.add(sym)
+                known_intraday[sym] = False
+                for dead_iv in ALL_INTERVALS:
+                    completed_pairs.add((sym, dead_iv))
             else:
                 completed_pairs.add((sym, iv))
                 if iv in INTRADAY_INTERVALS and status in ("checkpoint", "OK"):
                     known_intraday[sym] = True
-    return completed_pairs, known_intraday
+    return completed_pairs, known_intraday, failed_1d_symbols
 
 
 def _merge_and_encrypt_interval_chunk(
@@ -264,13 +275,16 @@ def run_node_pipeline(
 
     completed_pairs: set[tuple[str, str]] = set()
     known_intraday: dict[str, bool] = {}
+    failed_1d_symbols: set[str] = set()
 
     existing_cp_bytes = bucket.download_bytes(remote_checkpoint_path, must_exist=False)
     if existing_cp_bytes is not None:
         local_checkpoint.write_bytes(existing_cp_bytes)
-        completed_pairs, known_intraday = _parse_checkpoint_text(
-            existing_cp_bytes.decode("utf-8", errors="replace")
+        completed_pairs, known_intraday, cp_failed_1d = _parse_checkpoint_text(
+            existing_cp_bytes.decode("utf-8", errors="replace"),
+            is_failure_log=False,
         )
+        failed_1d_symbols.update(cp_failed_1d)
         print(
             f"[Pipeline] Resumed {len(completed_pairs):,} completed (symbol, interval) records "
             f"from {remote_checkpoint_path}.",
@@ -282,10 +296,12 @@ def run_node_pipeline(
     existing_fail_bytes = bucket.download_bytes(remote_failures_path, must_exist=False)
     if existing_fail_bytes is not None:
         local_failures.write_bytes(existing_fail_bytes)
-        fail_pairs, _ = _parse_checkpoint_text(
-            existing_fail_bytes.decode("utf-8", errors="replace")
+        fail_pairs, _, fl_failed_1d = _parse_checkpoint_text(
+            existing_fail_bytes.decode("utf-8", errors="replace"),
+            is_failure_log=True,
         )
         completed_pairs.update(fail_pairs)
+        failed_1d_symbols.update(fl_failed_1d)
     else:
         local_failures.write_text("", encoding="utf-8")
 
@@ -323,9 +339,15 @@ def run_node_pipeline(
             has_ultimate=has_ultimate,
             ultimate_jwt=ultimate_jwt,
         )
-        # Pre-populate known intraday capability from resumed checkpoint if available
+        # Pre-populate known intraday capability and failed-1D state from resumed logs
         for sym in chunk_syms:
-            if sym in known_intraday:
+            if sym in failed_1d_symbols:
+                ctx.symbol_metadata[sym] = {
+                    "has_intraday": False,
+                    "has_adjustment": False,
+                    "symbol_error": True,
+                }
+            elif sym in known_intraday:
                 ctx.symbol_metadata[sym] = {
                     "has_intraday": known_intraday[sym],
                     "has_adjustment": False,
@@ -374,6 +396,9 @@ def run_node_pipeline(
         for sym in chunk_syms:
             meta = ctx.symbol_metadata.get(sym, {})
             if meta.get("symbol_error", False):
+                failed_1d_symbols.add(sym)
+                for dead_iv in ALL_INTERVALS:
+                    completed_pairs.add((sym, dead_iv))
                 continue
 
             sym_is_futures = is_futures_exchange or sym.endswith("1!") or sym.endswith("2!")

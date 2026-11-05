@@ -469,16 +469,20 @@ def _worker_thread_loop(
                 picked_queue = ctx.intraday_queue
             except queue.Empty:
                 try:
-                    task = ctx.primary_queue.get(timeout=0.5)
+                    task = ctx.primary_queue.get_nowait()
                     picked_queue = ctx.primary_queue
                 except queue.Empty:
-                    continue
+                    break
         else:
             try:
-                task = ctx.primary_queue.get(timeout=0.5)
+                task = ctx.primary_queue.get_nowait()
                 picked_queue = ctx.primary_queue
             except queue.Empty:
-                continue
+                try:
+                    task = ctx.intraday_queue.get_nowait()
+                    picked_queue = ctx.intraday_queue
+                except queue.Empty:
+                    break
 
         if task is None:
             if picked_queue is not None:
@@ -589,12 +593,20 @@ def _worker_thread_loop(
             # status == "OK"
             if task.interval == "1D":
                 with ctx.results_lock:
-                    ctx.symbol_events[task.symbol] = raw_events
-                    ctx.symbol_metadata[task.symbol] = {
-                        "has_intraday": bool(resolved_meta.get("has_intraday", True)),
-                        "has_adjustment": bool(resolved_meta.get("has_adjustment", False)),
-                        "symbol_error": False,
-                    }
+                    if bars:
+                        ctx.symbol_events[task.symbol] = raw_events
+                        ctx.symbol_metadata[task.symbol] = {
+                            "has_intraday": bool(resolved_meta.get("has_intraday", True)),
+                            "has_adjustment": bool(resolved_meta.get("has_adjustment", False)),
+                            "symbol_error": False,
+                        }
+                    else:
+                        # 1D returned 0 bars (series_completed_but_empty) -> skip Stage 2 for this empty symbol
+                        ctx.symbol_metadata[task.symbol] = {
+                            "has_intraday": False,
+                            "has_adjustment": False,
+                            "symbol_error": True,
+                        }
                 events_for_sym = raw_events
             else:
                 with ctx.results_lock:
@@ -663,10 +675,6 @@ def run_task_batch_with_retries(
                 )
                 t.start()
                 threads.append(t)
-            for _ in range(ultimate_workers):
-                ctx.intraday_queue.put(None)
-            for _ in range(total_workers):
-                ctx.primary_queue.put(None)
         else:
             for i in range(total_workers):
                 t = threading.Thread(
@@ -676,8 +684,6 @@ def run_task_batch_with_retries(
                 )
                 t.start()
                 threads.append(t)
-            for _ in range(total_workers):
-                ctx.primary_queue.put(None)
 
         for t in threads:
             t.join()

@@ -640,6 +640,10 @@ def handle_node_callback(
             state["phase"] = "standby"
             push_standby_node(state, tokens, usernames, wait_if_running=False)
             save_fleet_state(bucket, state)
+            return
+
+        # Also reconcile any sibling nodes whose callbacks may have been coalesced by GitHub concurrency
+        reconcile_fleet(bucket, state, tokens, usernames)
         return
 
     if cb == "TIMEOUT":
@@ -660,6 +664,8 @@ def handle_node_callback(
             wait_if_running=True,
         )
         save_fleet_state(bucket, state)
+        # Reconcile any other nodes whose TIMEOUT callbacks arrived concurrently
+        reconcile_fleet(bucket, state, tokens, usernames)
         return
 
     if cb == "AUTH_FAILED":
@@ -692,6 +698,7 @@ def handle_node_callback(
                 wait_if_running=True,
             )
             save_fleet_state(bucket, state)
+        reconcile_fleet(bucket, state, tokens, usernames)
         return
 
     # Default: ERROR
@@ -714,6 +721,7 @@ def handle_node_callback(
             wait_if_running=True,
         )
         save_fleet_state(bucket, state)
+    reconcile_fleet(bucket, state, tokens, usernames)
 
 
 def print_fleet_status(

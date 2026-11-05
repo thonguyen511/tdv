@@ -145,10 +145,16 @@ def main() -> int:
     if args.max_chunks is not None:
         cmd.extend(["--max-chunks", str(args.max_chunks)])
 
+    # Stagger default 11h 45m watchdog by 60s per node_id so all 20 nodes never fire
+    # simultaneous repository_dispatch callbacks in the same second.
+    effective_timeout = args.timeout
+    if args.timeout == DEFAULT_TIMEOUT_SECONDS and "TIMEOUT_SECONDS" not in os.environ:
+        effective_timeout = max(3600, args.timeout - (int(args.notebook_id) * 60))
+
     print(
         f"=================================================================\n"
         f" [SUPERVISOR] Node {args.notebook_id} | Phase: {phase_mode.upper()} ({run_tag or 'auto'})\n"
-        f" Watchdog Limit: {args.timeout}s ({args.timeout / 3600:.2f} hours)\n"
+        f" Watchdog Limit: {effective_timeout}s ({effective_timeout / 3600:.2f} hours)\n"
         f" Command: {' '.join(cmd)}\n"
         f"=================================================================",
         flush=True,
@@ -178,9 +184,9 @@ def main() -> int:
                 break
 
             elapsed = time.time() - start_time
-            if elapsed >= args.timeout:
+            if elapsed >= effective_timeout:
                 print(
-                    f"\n[Supervisor] 11h 45m ({args.timeout}s) watchdog reached! "
+                    f"\n[Supervisor] Watchdog ({effective_timeout}s) reached! "
                     f"Terminating child process cleanly for session handoff...",
                     flush=True,
                 )
