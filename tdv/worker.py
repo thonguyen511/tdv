@@ -213,6 +213,7 @@ def _execute_task_on_ws(
     status = "OK"
     error_reason = ""
     last_wait = time.time()
+    series_completed_at: float | None = None
 
     while True:
         if ctx.abort_event.is_set() or ctx.auth_failed_event.is_set():
@@ -220,7 +221,13 @@ def _execute_task_on_ws(
             error_reason = "Aborted"
             break
 
-        if time.time() - last_wait > 25.0:
+        now_ts = time.time()
+        if is_1d and main_series_completed and series_completed_at is not None and (now_ts - series_completed_at > 6.0):
+            # Main 1D series completed >6s ago; don't let a silent study hang mutual funds/indices
+            status = "OK"
+            break
+
+        if now_ts - last_wait > 25.0:
             if bars and main_series_completed:
                 # Series already completed; don't discard valid bars if a study timed out
                 status = "OK"
@@ -233,20 +240,29 @@ def _execute_task_on_ws(
             ws.settimeout(3.0)
             raw_msg = ws.recv()
         except websocket.WebSocketTimeoutException:
-            if main_series_completed and (not is_1d or required_studies.issubset(completed_studies)):
+            if main_series_completed and (
+                not is_1d
+                or required_studies.issubset(completed_studies)
+                or (series_completed_at is not None and time.time() - series_completed_at > 6.0)
+            ):
                 break
             continue
         except Exception as exc:
-            status = "NETWORK_ERROR"
-            error_reason = f"Socket recv error: {exc}"
+            if bars and main_series_completed:
+                status = "OK"
+            else:
+                status = "NETWORK_ERROR"
+                error_reason = f"Socket recv error: {exc}"
             break
 
         if not raw_msg:
-            status = "NETWORK_ERROR"
-            error_reason = "Socket closed by remote"
+            if bars and main_series_completed:
+                status = "OK"
+            else:
+                status = "NETWORK_ERROR"
+                error_reason = "Socket closed by remote"
             break
 
-        last_wait = time.time()
         ws_buffer += raw_msg
         messages, ws_buffer = parse_ws_messages(ws_buffer)
 
@@ -262,6 +278,7 @@ def _execute_task_on_ws(
             except Exception:
                 continue
 
+            last_wait = time.time()
             m_type = data.get("m")
             params = data.get("p", [])
 
@@ -351,9 +368,13 @@ def _execute_task_on_ws(
                         )
                     else:
                         main_series_completed = True
+                        if series_completed_at is None:
+                            series_completed_at = time.time()
                 else:
                     # 1D initial load (2,000,000 bars covers all 1D history in 1 batch) or Weekly Phase 2
                     main_series_completed = True
+                    if series_completed_at is None:
+                        series_completed_at = time.time()
 
                 if main_series_completed and (not is_1d or required_studies.issubset(completed_studies)):
                     done_loop = True

@@ -203,6 +203,81 @@ def wait_until_kernel_not_running(
     return state
 
 
+def delete_kernel_if_exists(
+    username: str,
+    slug: str,
+    api_token: str,
+    wait_if_running: bool = True,
+) -> bool:
+    """
+    Delete `username/slug` from Kaggle if it exists so old finished notebooks
+    do not clutter the Kaggle accounts across Standby <-> Weekly transitions.
+    """
+    if not username or not api_token:
+        return False
+    if wait_if_running:
+        k_state = wait_until_kernel_not_running(username, slug, api_token, max_wait_seconds=90)
+    else:
+        k_state = get_kernel_state(username, slug, api_token)
+
+    if k_state == "not_found":
+        return True
+
+    # 1. Try kagglesdk delete_kernel in-process
+    try:
+        from kagglesdk import KaggleClient
+        from kagglesdk.kernels.types.kernels_api_service import ApiDeleteKernelRequest
+
+        client = KaggleClient(api_token=api_token)
+        req = ApiDeleteKernelRequest()
+        req.user_name = username
+        req.kernel_slug = slug
+        client.kernels.kernels_api_client.delete_kernel(req)
+        print(f"[FleetManager] Deleted old kernel {username}/{slug}", flush=True)
+        return True
+    except Exception as exc:
+        if "404" in str(exc) or "not found" in str(exc).lower() or "403" in str(exc):
+            return True
+
+    # 2. Fallback to kaggle CLI
+    env = os.environ.copy()
+    env["KAGGLE_API_TOKEN"] = api_token
+    try:
+        res = subprocess.run(
+            ["kaggle", "kernels", "delete", "-y", f"{username}/{slug}"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if res.returncode == 0 or "404" in (res.stdout + res.stderr):
+            print(f"[FleetManager] Deleted old kernel {username}/{slug}", flush=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def delete_all_worker_kernels(
+    tokens: list[str],
+    usernames: dict[int, str],
+    wait_if_running: bool = False,
+) -> None:
+    """Delete all 20 worker kernels (`tdv-node-0..19`) across the 4 Kaggle accounts."""
+    print("[FleetManager] Cleaning up old worker notebooks (tdv-node-0..19) across all accounts...", flush=True)
+    for node_id in range(TOTAL_NOTEBOOKS):
+        acc_idx = get_account_index_for_node(node_id)
+        api_token = tokens[acc_idx] if acc_idx < len(tokens) else ""
+        username = usernames.get(acc_idx, "")
+        if api_token and username:
+            delete_kernel_if_exists(
+                username=username,
+                slug=f"tdv-node-{node_id}",
+                api_token=api_token,
+                wait_if_running=wait_if_running,
+            )
+
+
 def default_fleet_state(phase: str = "initial", run_tag: str = "INITIAL") -> dict[str, Any]:
     """Return a clean initial `control/state.json` dictionary."""
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -339,17 +414,25 @@ def build_standby_runner_script() -> str:
     """Generate the self-bootstrapping script for `tdv-standby`."""
     gh_pat = os.environ.get("GH_PAT", "").strip()
     gh_repo = os.environ.get("GITHUB_REPO", DEFAULT_GITHUB_REPO).strip()
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    hf_bucket = os.environ.get("HF_BUCKET_ID", DEFAULT_HF_BUCKET_ID).strip()
 
     return f'''import os
 import shutil
 import subprocess
 import sys
 
+os.environ["HF_HOME"] = "/tmp/hf_cache"
 os.environ["GH_PAT"] = {json.dumps(gh_pat)}
 os.environ["GITHUB_REPO"] = {json.dumps(gh_repo)}
+os.environ["HF_TOKEN"] = {json.dumps(hf_token)}
+os.environ["HF_BUCKET_ID"] = {json.dumps(hf_bucket)}
 
 print("=== [TDV Standby Runner] Bootstrapping Standby Master Clock ===", flush=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "requests"], check=True)
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "requests", "huggingface_hub>=1.5.0"],
+    check=True,
+)
 
 repo_dir = "/tmp/tdv_repo"
 if os.path.exists(repo_dir):
@@ -359,7 +442,27 @@ clone_url = f"https://{{os.environ['GH_PAT']}}@github.com/{gh_repo}.git" if os.e
 subprocess.run(["git", "clone", "--depth", "1", clone_url, repo_dir], check=True)
 
 proc = subprocess.run([sys.executable, "-u", "-m", "tdv.standby_clock"], cwd=repo_dir)
+if proc.returncode != 0 and os.environ.get("GH_PAT"):
+    import requests
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    st = "TRIGGER_WEEKLY" if now.weekday() == 0 else "REARM_STANDBY"
+    ph = "weekly" if st == "TRIGGER_WEEKLY" else "standby"
+    try:
+        requests.post(
+            f"https://api.github.com/repos/{gh_repo}/dispatches",
+            headers={{
+                "Authorization": f"Bearer {{os.environ['GH_PAT']}}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }},
+            json={{"event_type": "kaggle_node_callback", "client_payload": {{"node_id": 99, "status": st, "phase": ph}}}},
+            timeout=20,
+        )
+    except Exception:
+        pass
 shutil.rmtree(repo_dir, ignore_errors=True)
+shutil.rmtree("/tmp/hf_cache", ignore_errors=True)
 sys.exit(proc.returncode)
 '''
 
@@ -370,8 +473,9 @@ def _push_kernel_via_cli(
     title: str,
     script_code: str,
     api_token: str,
+    max_attempts: int = 3,
 ) -> bool:
-    """Write kernel metadata + script to a temp directory and push via `kaggle kernels push`."""
+    """Write kernel metadata + script to a temp directory and push via Kaggle API/CLI with retry."""
     with tempfile.TemporaryDirectory(prefix=f"kgl_{slug}_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         code_file = f"{slug}.py"
@@ -395,44 +499,47 @@ def _push_kernel_via_cli(
             json.dumps(metadata, indent=2), encoding="utf-8"
         )
 
-        prev_tok = os.environ.get("KAGGLE_API_TOKEN")
-        os.environ["KAGGLE_API_TOKEN"] = api_token
-        try:
-            from kaggle.api.kaggle_api_extended import KaggleApi
+        for attempt in range(1, max_attempts + 1):
+            prev_tok = os.environ.get("KAGGLE_API_TOKEN")
+            os.environ["KAGGLE_API_TOKEN"] = api_token
+            try:
+                from kaggle.api.kaggle_api_extended import KaggleApi
 
-            api = KaggleApi()
-            api.authenticate()
-            resp = api.kernels_push(str(tmp_path))
-            err_msg = getattr(resp, "error", None)
-            if not err_msg:
-                url = getattr(resp, "url", f"https://www.kaggle.com/code/{username}/{slug}")
-                print(f"[FleetManager] Pushed {username}/{slug} -> {url}", flush=True)
+                api = KaggleApi()
+                api.authenticate()
+                resp = api.kernels_push(str(tmp_path))
+                err_msg = getattr(resp, "error", None)
+                if not err_msg:
+                    url = getattr(resp, "url", f"https://www.kaggle.com/code/{username}/{slug}")
+                    print(f"[FleetManager] Pushed {username}/{slug} -> {url}", flush=True)
+                    return True
+            except Exception:
+                pass
+            finally:
+                if prev_tok is None:
+                    os.environ.pop("KAGGLE_API_TOKEN", None)
+                else:
+                    os.environ["KAGGLE_API_TOKEN"] = prev_tok
+
+            env = os.environ.copy()
+            env["KAGGLE_API_TOKEN"] = api_token
+            res = subprocess.run(
+                ["kaggle", "kernels", "push", "-p", str(tmp_path)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if res.returncode == 0:
+                print(f"[FleetManager] Pushed {username}/{slug}: {res.stdout.strip()}", flush=True)
                 return True
-        except Exception:
-            pass
-        finally:
-            if prev_tok is None:
-                os.environ.pop("KAGGLE_API_TOKEN", None)
-            else:
-                os.environ["KAGGLE_API_TOKEN"] = prev_tok
-
-        env = os.environ.copy()
-        env["KAGGLE_API_TOKEN"] = api_token
-        res = subprocess.run(
-            ["kaggle", "kernels", "push", "-p", str(tmp_path)],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if res.returncode == 0:
-            print(f"[FleetManager] Pushed {username}/{slug}: {res.stdout.strip()}", flush=True)
-            return True
-        print(
-            f"[FleetManager] Failed to push {username}/{slug} (code={res.returncode}): "
-            f"{res.stdout} {res.stderr}",
-            flush=True,
-        )
+            print(
+                f"[FleetManager] Attempt {attempt}/{max_attempts} failed to push {username}/{slug} "
+                f"(code={res.returncode}): {res.stdout} {res.stderr}",
+                flush=True,
+            )
+            if attempt < max_attempts:
+                time.sleep(5 * attempt)
         return False
 
 
@@ -496,6 +603,8 @@ def push_standby_node(
     title = "TDV Standby"
     if wait_if_running:
         k_state = wait_until_kernel_not_running(username, slug, api_token, max_wait_seconds=120)
+        if k_state not in ("running", "queued", "not_found"):
+            delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
     else:
         k_state = get_kernel_state(username, slug, api_token)
 
@@ -538,9 +647,11 @@ def reconcile_fleet(
     if phase != "standby" and all(nodes[str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
         print(
             f"[FleetManager] All {TOTAL_NOTEBOOKS} nodes completed {run_tag}! "
-            f"Transitioning fleet to 'standby' phase and launching Standby Master Clock.",
+            f"Deleting finished worker notebooks, transitioning fleet to 'standby' phase, "
+            f"and launching Standby Master Clock.",
             flush=True,
         )
+        delete_all_worker_kernels(tokens, usernames, wait_if_running=True)
         state["phase"] = "standby"
         push_standby_node(state, tokens, usernames, wait_if_running=False)
         save_fleet_state(bucket, state)
@@ -599,8 +710,20 @@ def handle_node_callback(
     Process a `repository_dispatch` callback from a Kaggle worker or Standby Clock.
     """
     cb = callback_status.strip().upper()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
     print(f"[FleetManager] Processing callback: node_id={node_id}, status={cb}", flush=True)
+
+    # Safety promotion: if REARM_STANDBY arrives on Monday UTC and this week's tag hasn't run yet,
+    # promote it to TRIGGER_WEEKLY so a Monday boundary handoff never misses the weekly launch.
+    if cb == "REARM_STANDBY" and now_utc.weekday() == 0:
+        expected_week_tag = compute_weekly_run_tag(now_utc)
+        if str(state.get("run_tag", "")) != expected_week_tag:
+            print(
+                f"[FleetManager] Promoting Monday REARM_STANDBY -> TRIGGER_WEEKLY ({expected_week_tag})",
+                flush=True,
+            )
+            cb = "TRIGGER_WEEKLY"
 
     # 1. Standby Clock Callbacks
     if cb == "REARM_STANDBY":
@@ -610,8 +733,20 @@ def handle_node_callback(
         return
 
     if cb == "TRIGGER_WEEKLY":
-        week_tag = compute_weekly_run_tag()
-        print(f"[FleetManager] TRIGGER_WEEKLY received -> starting {week_tag} across all 20 nodes!", flush=True)
+        week_tag = compute_weekly_run_tag(now_utc)
+        print(
+            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby & old worker notebooks, "
+            f"then starting {week_tag} across all 20 nodes!",
+            flush=True,
+        )
+        if tokens and usernames.get(0):
+            delete_kernel_if_exists(
+                username=usernames[0],
+                slug="tdv-standby",
+                api_token=tokens[0],
+                wait_if_running=True,
+            )
+        delete_all_worker_kernels(tokens, usernames, wait_if_running=False)
         new_state = default_fleet_state(phase=week_tag, run_tag=week_tag)
         state.clear()
         state.update(new_state)
@@ -634,9 +769,10 @@ def handle_node_callback(
         if all(state["nodes"][str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
             print(
                 f"[FleetManager] All {TOTAL_NOTEBOOKS} nodes are now DONE! "
-                "Transitioning to 'standby' and launching tdv-standby.",
+                "Deleting finished worker notebooks, transitioning to 'standby', and launching tdv-standby.",
                 flush=True,
             )
+            delete_all_worker_kernels(tokens, usernames, wait_if_running=True)
             state["phase"] = "standby"
             push_standby_node(state, tokens, usernames, wait_if_running=False)
             save_fleet_state(bucket, state)
