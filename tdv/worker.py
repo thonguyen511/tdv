@@ -512,6 +512,7 @@ def _worker_thread_loop(
 
         try:
             time.sleep(random.uniform(0.02, 0.05))
+            reused_socket = ws is not None
 
             if ws is None:
                 try:
@@ -550,19 +551,73 @@ def _worker_thread_loop(
                             ctx.network_retry_tasks.append(task)
                     else:
                         with ctx.results_lock:
+                            if task.interval == "1D":
+                                ctx.symbol_metadata[task.symbol] = {
+                                    "has_intraday": False,
+                                    "has_adjustment": False,
+                                    "symbol_error": True,
+                                }
                             ctx.failure_logs.append(
                                 (task.symbol, task.interval, f"Connect failed: {conn_exc}")
                             )
                     continue
 
-            (
-                status,
-                error_reason,
-                ws_buffer,
-                bars,
-                raw_events,
-                resolved_meta,
-            ) = _execute_task_on_ws(ws, ws_buffer, task, ctx)
+            try:
+                (
+                    status,
+                    error_reason,
+                    ws_buffer,
+                    bars,
+                    raw_events,
+                    resolved_meta,
+                ) = _execute_task_on_ws(ws, ws_buffer, task, ctx)
+            except Exception as send_exc:
+                # `ws.send()` on a socket the server already closed raises
+                # BrokenPipeError / WebSocketConnectionClosedException. Treat it as a
+                # transient NETWORK_ERROR so the thread survives and the task is retried
+                # instead of silently killing the worker and dropping the task.
+                status = "NETWORK_ERROR"
+                error_reason = f"Socket send error: {type(send_exc).__name__}: {send_exc}"
+                bars, raw_events, resolved_meta = {}, {}, {}
+
+            # If a reused persistent socket was closed by the server between tasks
+            # (BrokenPipeError on send or immediate EOF on recv), immediately reconnect
+            # a fresh socket and retry the task in-place without burning `task.retries`.
+            if (
+                status == "NETWORK_ERROR"
+                and reused_socket
+                and not bars
+                and not ctx.abort_event.is_set()
+                and not ctx.auth_failed_event.is_set()
+            ):
+                _close_ws()
+                time.sleep(random.uniform(0.1, 0.3))
+                try:
+                    jwt_tok = (
+                        ctx.ultimate_jwt
+                        if is_ultimate_worker and ctx.ultimate_jwt
+                        else ctx.jwt_manager.get_jwt(force_refresh=False)
+                    )
+                    ws = _connect_ws(endpoint, jwt_tok)
+                    ws_buffer = ""
+                    (
+                        status,
+                        error_reason,
+                        ws_buffer,
+                        bars,
+                        raw_events,
+                        resolved_meta,
+                    ) = _execute_task_on_ws(ws, ws_buffer, task, ctx)
+                except TVAuthError as auth_exc:
+                    print(f"[Worker-{worker_id}] {auth_exc}", flush=True)
+                    ctx.auth_failed_event.set()
+                    ctx.abort_event.set()
+                    break
+                except Exception as retry_exc:
+                    _close_ws()
+                    status = "NETWORK_ERROR"
+                    error_reason = f"Reconnect retry error: {type(retry_exc).__name__}: {retry_exc}"
+                    bars, raw_events, resolved_meta = {}, {}, {}
 
             if status == "AUTH_ERROR":
                 _close_ws()
@@ -580,6 +635,12 @@ def _worker_thread_loop(
                         ctx.network_retry_tasks.append(task)
                 else:
                     with ctx.results_lock:
+                        if task.interval == "1D":
+                            ctx.symbol_metadata[task.symbol] = {
+                                "has_intraday": False,
+                                "has_adjustment": False,
+                                "symbol_error": True,
+                            }
                         ctx.failure_logs.append(
                             (task.symbol, task.interval, f"Auth error: {error_reason}")
                         )
@@ -587,12 +648,19 @@ def _worker_thread_loop(
 
             if status == "NETWORK_ERROR":
                 _close_ws()
+                time.sleep(random.uniform(0.3, 1.0))
                 if task.retries < MAX_TASK_RETRIES:
                     task.retries += 1
                     with ctx.results_lock:
                         ctx.network_retry_tasks.append(task)
                 else:
                     with ctx.results_lock:
+                        if task.interval == "1D":
+                            ctx.symbol_metadata[task.symbol] = {
+                                "has_intraday": False,
+                                "has_adjustment": False,
+                                "symbol_error": True,
+                            }
                         ctx.failure_logs.append(
                             (task.symbol, task.interval, f"Network error: {error_reason}")
                         )
@@ -722,13 +790,20 @@ def run_task_batch_with_retries(
             except queue.Empty:
                 break
 
-        if ctx.network_retry_tasks and not ctx.abort_event.is_set():
+        if ctx.network_retry_tasks and not ctx.abort_event.is_set() and not ctx.auth_failed_event.is_set():
             pending = list(ctx.network_retry_tasks)
             ctx.network_retry_tasks.clear()
+            backoff_sec = min(30.0, 4.0 * round_num)
             print(
-                f"[WorkerPool] Retrying {len(pending)} transient network tasks (round {round_num + 1})...",
+                f"[WorkerPool] Retrying {len(pending)} transient network tasks "
+                f"(round {round_num + 1}, backoff {backoff_sec:.0f}s)...",
                 flush=True,
             )
-            time.sleep(2.0)
+            time.sleep(backoff_sec)
+            if round_num >= 2:
+                try:
+                    ctx.jwt_manager.get_jwt(force_refresh=True)
+                except Exception:
+                    pass
         else:
             break

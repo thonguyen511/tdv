@@ -48,7 +48,7 @@ ALL_INTERVALS = DAILY_INTERVALS + INTRADAY_INTERVALS
 BARS_INITIAL_LOAD = 50000
 BARS_MORE_LOAD = 50000
 MAX_HISTORY_BATCHES = 1000  # Phase 1: up to 50M bars backwards paging
-MAX_TASK_RETRIES = 3
+MAX_TASK_RETRIES = 6
 
 # ---------------------------------------------------------------------------
 # Supervisor & Standby Timing

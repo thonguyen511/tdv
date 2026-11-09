@@ -77,6 +77,36 @@ COLUMNS_LEGACY_12 = COLUMNS_EVENT + ["last_splits"]
 COLUMNS_STANDARD = ["symbol", "time", "open", "high", "low", "close", "volume"]
 
 
+def _is_transient_failure_reason(reason: str) -> bool:
+    """
+    Return `True` if a failure log reason was caused by a transient socket,
+    network, or auth issue (which must be retried) rather than a definitive
+    TradingView response (`series_completed_but_empty` or `Symbol error:`).
+    """
+    r = reason.strip().lower()
+    return (
+        r.startswith("network error")
+        or r.startswith("connect failed")
+        or r.startswith("auth error")
+        or "socket" in r
+        or "recv timeout" in r
+        or "broken pipe" in r
+        or r == "aborted"
+    )
+
+
+def _filter_definitive_failure_lines(raw_text: str) -> str:
+    """Keep only definitive TradingView failure lines when resuming `failures.log`."""
+    kept: list[str] = []
+    for line in raw_text.splitlines():
+        parts = [p.strip() for p in line.strip().split(",", 4)]
+        if len(parts) >= 5 and _is_transient_failure_reason(parts[4]):
+            continue
+        if line.strip():
+            kept.append(line)
+    return ("\n".join(kept) + "\n") if kept else ""
+
+
 def _parse_checkpoint_text(
     raw_text: str,
     is_failure_log: bool = False,
@@ -95,16 +125,20 @@ def _parse_checkpoint_text(
     known_intraday: dict[str, bool] = {}
     failed_1d_symbols: set[str] = set()
     for line in raw_text.splitlines():
-        parts = [p.strip() for p in line.strip().split(",")]
+        parts = [p.strip() for p in line.strip().split(",", 4)]
         if len(parts) >= 3:
             sym, iv = parts[1], parts[2]
             status = parts[3] if len(parts) >= 4 else "checkpoint"
+            reason = parts[4] if len(parts) >= 5 else ""
+            if (is_failure_log or status == "tradingview_message") and _is_transient_failure_reason(reason):
+                # Transient network/socket errors are NEVER treated as completed
+                continue
             if iv == "INTRADAY" or status in ("skipped", "SKIPPED_NO_INTRADAY"):
                 known_intraday[sym] = False
                 for intra_iv in INTRADAY_INTERVALS:
                     completed_pairs.add((sym, intra_iv))
             elif (is_failure_log or status == "tradingview_message") and iv == STAGE1_INTERVAL:
-                # 1D failed or had 0 bars -> all intervals for this symbol are skipped in Stage 2
+                # Definitive 1D symbol error or 0 bars -> all intervals skipped in Stage 2
                 failed_1d_symbols.add(sym)
                 known_intraday[sym] = False
                 for dead_iv in ALL_INTERVALS:
@@ -114,6 +148,97 @@ def _parse_checkpoint_text(
                 if iv in INTRADAY_INTERVALS and status in ("checkpoint", "OK"):
                     known_intraday[sym] = True
     return completed_pairs, known_intraday, failed_1d_symbols
+
+
+def _reconcile_resumed_logs(
+    cp_text: str,
+    fl_text: str,
+) -> tuple[
+    str,
+    str,
+    set[tuple[str, str]],
+    dict[str, bool],
+    set[str],
+]:
+    """
+    Reconcile `checkpoint.log` and `failures.log` text:
+    1. Strip transient network/socket failure lines from `failures.log`.
+    2. Invalidate any Stage 2 records (`1W`, `1M`, `INTRADAY skipped`) for symbols
+       whose `1D` discovery is missing (e.g., if `1D` was dropped by a socket error
+       or failed transiently in a prior run), ensuring Stage 1 (`1D` + corporate
+       actions + true `has_intraday`) and Stage 2 are re-run cleanly.
+    """
+    cleaned_fl = _filter_definitive_failure_lines(fl_text)
+    cp_done, known_intraday, cp_f1d = _parse_checkpoint_text(cp_text, is_failure_log=False)
+    fl_done, _, fl_f1d = _parse_checkpoint_text(cleaned_fl, is_failure_log=True)
+
+    completed_pairs = set(cp_done) | set(fl_done)
+    failed_1d_symbols = set(cp_f1d) | set(fl_f1d)
+
+    all_seen_syms = {s for s, _ in completed_pairs}
+    syms_missing_1d = {
+        s for s in all_seen_syms if (s, STAGE1_INTERVAL) not in completed_pairs
+    }
+
+    if syms_missing_1d:
+        completed_pairs = {
+            (s, iv) for (s, iv) in completed_pairs if s not in syms_missing_1d
+        }
+        for s in syms_missing_1d:
+            known_intraday.pop(s, None)
+
+        kept_cp: list[str] = []
+        for line in cp_text.splitlines():
+            parts = [p.strip() for p in line.strip().split(",", 4)]
+            if len(parts) >= 3 and parts[1] in syms_missing_1d:
+                continue
+            if line.strip():
+                kept_cp.append(line)
+        cleaned_cp = ("\n".join(kept_cp) + "\n") if kept_cp else ""
+    else:
+        cleaned_cp = cp_text
+
+    return cleaned_cp, cleaned_fl, completed_pairs, known_intraday, failed_1d_symbols
+
+
+def count_node_missing_tasks(
+    bucket: BucketClient,
+    notebook_id: int,
+    run_tag: str,
+    map_path: Path | None = None,
+    data_dir: Path | None = None,
+) -> int:
+    """
+    Download `checkpoint.log` and `failures.log` for `(notebook_id, run_tag)` from
+    the bucket and return the exact number of `(symbol, interval)` tasks across all
+    assigned chunks that are missing or failed with a transient network/socket error.
+    """
+    repo_root = get_repo_root()
+    resolved_map_path = map_path or (repo_root / "map.json")
+    resolved_data_dir = data_dir or (repo_root / "data")
+    map_data = json.loads(resolved_map_path.read_text(encoding="utf-8"))
+    assignments = expand_node_assignments(
+        map_data=map_data,
+        notebook_id=notebook_id,
+        data_dir=resolved_data_dir,
+        chunk_size=CHUNK_SIZE,
+    )
+
+    remote_log_dir = get_log_bucket_dir(notebook_id, run_tag)
+    cp_bytes = bucket.download_bytes(f"{remote_log_dir}/checkpoint.log", must_exist=False)
+    fl_bytes = bucket.download_bytes(f"{remote_log_dir}/failures.log", must_exist=False)
+
+    cp_text = cp_bytes.decode("utf-8", errors="replace") if cp_bytes is not None else ""
+    fl_text = fl_bytes.decode("utf-8", errors="replace") if fl_bytes is not None else ""
+    _, _, completed_pairs, _, _ = _reconcile_resumed_logs(cp_text, fl_text)
+
+    return sum(
+        1
+        for chunk in assignments
+        for sym in chunk.symbols
+        for iv in ALL_INTERVALS
+        if (sym, iv) not in completed_pairs
+    )
 
 
 def _merge_and_encrypt_interval_chunk(
@@ -273,37 +398,28 @@ def run_node_pipeline(
     remote_failures_path = f"{remote_log_dir}/failures.log"
     remote_completed_path = f"{remote_log_dir}/COMPLETED"
 
-    completed_pairs: set[tuple[str, str]] = set()
-    known_intraday: dict[str, bool] = {}
-    failed_1d_symbols: set[str] = set()
-
     existing_cp_bytes = bucket.download_bytes(remote_checkpoint_path, must_exist=False)
-    if existing_cp_bytes is not None:
-        local_checkpoint.write_bytes(existing_cp_bytes)
-        completed_pairs, known_intraday, cp_failed_1d = _parse_checkpoint_text(
-            existing_cp_bytes.decode("utf-8", errors="replace"),
-            is_failure_log=False,
-        )
-        failed_1d_symbols.update(cp_failed_1d)
+    existing_fail_bytes = bucket.download_bytes(remote_failures_path, must_exist=False)
+
+    raw_cp_text = existing_cp_bytes.decode("utf-8", errors="replace") if existing_cp_bytes is not None else ""
+    raw_fl_text = existing_fail_bytes.decode("utf-8", errors="replace") if existing_fail_bytes is not None else ""
+
+    (
+        cleaned_cp_text,
+        cleaned_fail_text,
+        completed_pairs,
+        known_intraday,
+        failed_1d_symbols,
+    ) = _reconcile_resumed_logs(raw_cp_text, raw_fl_text)
+
+    local_checkpoint.write_text(cleaned_cp_text, encoding="utf-8")
+    local_failures.write_text(cleaned_fail_text, encoding="utf-8")
+    if completed_pairs:
         print(
-            f"[Pipeline] Resumed {len(completed_pairs):,} completed (symbol, interval) records "
-            f"from {remote_checkpoint_path}.",
+            f"[Pipeline] Resumed {len(completed_pairs):,} verified (symbol, interval) records "
+            f"from {remote_log_dir}.",
             flush=True,
         )
-    else:
-        local_checkpoint.write_text("", encoding="utf-8")
-
-    existing_fail_bytes = bucket.download_bytes(remote_failures_path, must_exist=False)
-    if existing_fail_bytes is not None:
-        local_failures.write_bytes(existing_fail_bytes)
-        fail_pairs, _, fl_failed_1d = _parse_checkpoint_text(
-            existing_fail_bytes.decode("utf-8", errors="replace"),
-            is_failure_log=True,
-        )
-        completed_pairs.update(fail_pairs)
-        failed_1d_symbols.update(fl_failed_1d)
-    else:
-        local_failures.write_text("", encoding="utf-8")
 
     # 6. Process each 2,000-symbol chunk in Two Stages
     for pos, chunk in enumerate(assignments, start=1):
@@ -356,6 +472,8 @@ def run_node_pipeline(
 
         # -------------------------------------------------------------------
         # STAGE 1: 1D Discovery + Corporate Action Studies
+        # Also run Stage 1 for any symbol that still has incomplete Stage 2
+        # intervals so `ctx.symbol_events` and `has_intraday` are populated.
         # -------------------------------------------------------------------
         tasks_1d = [
             TaskItem(
@@ -364,7 +482,8 @@ def run_node_pipeline(
                 is_futures=(is_futures_exchange or sym.endswith("1!") or sym.endswith("2!")),
             )
             for sym in chunk_syms
-            if (sym, STAGE1_INTERVAL) not in completed_pairs
+            if sym not in failed_1d_symbols
+            and any((sym, iv) not in completed_pairs for iv in ALL_INTERVALS)
         ]
 
         if tasks_1d:
@@ -394,11 +513,18 @@ def run_node_pipeline(
         intraday_skipped_syms: list[str] = []
 
         for sym in chunk_syms:
+            if sym not in ctx.symbol_metadata and (sym, STAGE1_INTERVAL) not in completed_pairs:
+                # 1D did not complete (e.g. unexpected drop); do not run Stage 2 or mark INTRADAY skipped
+                continue
             meta = ctx.symbol_metadata.get(sym, {})
             if meta.get("symbol_error", False):
-                failed_1d_symbols.add(sym)
-                for dead_iv in ALL_INTERVALS:
-                    completed_pairs.add((sym, dead_iv))
+                if (sym, STAGE1_INTERVAL) in completed_pairs or any(
+                    s == sym and iv == STAGE1_INTERVAL and not _is_transient_failure_reason(r)
+                    for s, iv, r in ctx.failure_logs
+                ):
+                    failed_1d_symbols.add(sym)
+                    for dead_iv in ALL_INTERVALS:
+                        completed_pairs.add((sym, dead_iv))
                 continue
 
             sym_is_futures = is_futures_exchange or sym.endswith("1!") or sym.endswith("2!")
@@ -473,12 +599,13 @@ def run_node_pipeline(
             remote_chunk_path = get_chunk_bucket_path(exchange, interval, chunk_idx)
             batch_uploads.append((enc_bytes, remote_chunk_path))
 
-            # Log full symbol, bar count, and full bucket path in checkpoint.log (matching old code)
+            # Log full symbol, bar count, and full bucket path in checkpoint.log (without duplicates on resume)
             for sym_name, b_count in sym_counts.items():
-                checkpoint_lines.append(
-                    f"{now_ts}, {sym_name}, {interval}, checkpoint, Bars: {b_count}, {remote_chunk_path}"
-                )
-                completed_pairs.add((sym_name, interval))
+                if (sym_name, interval) not in completed_pairs:
+                    checkpoint_lines.append(
+                        f"{now_ts}, {sym_name}, {interval}, checkpoint, Bars: {b_count}, {remote_chunk_path}"
+                    )
+                    completed_pairs.add((sym_name, interval))
 
         # Log skipped intraday symbols in checkpoint.log (matching old code)
         for sym_name in intraday_skipped_syms:
@@ -495,8 +622,19 @@ def run_node_pipeline(
             with local_failures.open("a", encoding="utf-8") as f_fl:
                 for sym, iv, reason in ctx.failure_logs:
                     clean_reason = reason.replace("\n", " ").replace("\r", " ").strip()
-                    f_fl.write(f"{now_ts}, {sym}, {iv}, tradingview_message, {clean_reason}\n")
-                    completed_pairs.add((sym, iv))
+                    if _is_transient_failure_reason(clean_reason):
+                        print(
+                            f"    [Integrity] Transient failure for ({sym}, {iv}): {clean_reason} -> will retry.",
+                            flush=True,
+                        )
+                        continue
+                    if (sym, iv) not in completed_pairs:
+                        f_fl.write(f"{now_ts}, {sym}, {iv}, tradingview_message, {clean_reason}\n")
+                        completed_pairs.add((sym, iv))
+                        if iv == STAGE1_INTERVAL:
+                            failed_1d_symbols.add(sym)
+                            for dead_iv in ALL_INTERVALS:
+                                completed_pairs.add((sym, dead_iv))
 
         batch_uploads.append((local_checkpoint.read_bytes(), remote_checkpoint_path))
         batch_uploads.append((local_failures.read_bytes(), remote_failures_path))
@@ -508,11 +646,27 @@ def run_node_pipeline(
         )
         bucket.upload_files_batch(batch_uploads)
 
-    # 7. Mark Node Run as COMPLETED in Bucket
+    # 7. Data Flow Integrity Verification before marking COMPLETED
+    missing_tasks_count = sum(
+        1
+        for chunk in assignments
+        for sym in chunk.symbols
+        for iv in ALL_INTERVALS
+        if (sym, iv) not in completed_pairs
+    )
+    if missing_tasks_count > 0:
+        print(
+            f"[Pipeline] Data Integrity Gate: {missing_tasks_count} symbol/interval task(s) "
+            f"are still incomplete for Node {notebook_id} ({effective_run_tag}). "
+            f"Not writing COMPLETED marker; returning EXIT_ERROR so FleetManager re-pushes continuation.",
+            flush=True,
+        )
+        return EXIT_ERROR
+
     completed_ts = datetime.now(timezone.utc).isoformat().encode("utf-8")
     bucket.upload_bytes(remote_completed_path, completed_ts)
     print(
-        f"[Pipeline] Node {notebook_id} completed all {len(assignments)} chunks for {effective_run_tag}! "
+        f"[Pipeline] Node {notebook_id} verified 100% complete across all {len(assignments)} chunks for {effective_run_tag}! "
         f"Marker written to {remote_completed_path}.",
         flush=True,
     )

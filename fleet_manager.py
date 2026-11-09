@@ -43,6 +43,7 @@ from tdv.config import (
     TOTAL_NOTEBOOKS,
     compute_weekly_run_tag,
 )
+from tdv.pipeline import count_node_missing_tasks
 
 KAGGLE_API_BASE = "https://www.kaggle.com/api/v1"
 
@@ -233,11 +234,12 @@ def delete_kernel_if_exists(
         req.user_name = username
         req.kernel_slug = slug
         client.kernels.kernels_api_client.delete_kernel(req)
-        print(f"[FleetManager] Deleted old kernel {username}/{slug}", flush=True)
+        print(f"[FleetManager] Deleted kernel {username}/{slug} (was '{k_state}')", flush=True)
         return True
     except Exception as exc:
-        if "404" in str(exc) or "not found" in str(exc).lower() or "403" in str(exc):
+        if "404" in str(exc) or "not found" in str(exc).lower():
             return True
+        print(f"[FleetManager] kagglesdk delete_kernel note for {username}/{slug}: {exc}", flush=True)
 
     # 2. Fallback to kaggle CLI
     env = os.environ.copy()
@@ -251,10 +253,14 @@ def delete_kernel_if_exists(
             timeout=30,
         )
         if res.returncode == 0 or "404" in (res.stdout + res.stderr):
-            print(f"[FleetManager] Deleted old kernel {username}/{slug}", flush=True)
+            print(f"[FleetManager] Deleted kernel {username}/{slug} via CLI (was '{k_state}')", flush=True)
             return True
-    except Exception:
-        pass
+        print(
+            f"[FleetManager] Warning: CLI delete failed for {username}/{slug}: {res.stdout} {res.stderr}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[FleetManager] Warning: CLI delete exception for {username}/{slug}: {exc}", flush=True)
     return False
 
 
@@ -262,6 +268,7 @@ def delete_all_worker_kernels(
     tokens: list[str],
     usernames: dict[int, str],
     wait_if_running: bool = False,
+    verify_stopped: bool = False,
 ) -> None:
     """Delete all 20 worker kernels (`tdv-node-0..19`) across the 4 Kaggle accounts."""
     print("[FleetManager] Cleaning up old worker notebooks (tdv-node-0..19) across all accounts...", flush=True)
@@ -276,6 +283,35 @@ def delete_all_worker_kernels(
                 api_token=api_token,
                 wait_if_running=wait_if_running,
             )
+
+    if verify_stopped:
+        deadline = time.time() + 45
+        pending_nodes = list(range(TOTAL_NOTEBOOKS))
+        while pending_nodes and time.time() < deadline:
+            still_running: list[int] = []
+            for node_id in pending_nodes:
+                acc_idx = get_account_index_for_node(node_id)
+                api_token = tokens[acc_idx] if acc_idx < len(tokens) else ""
+                username = usernames.get(acc_idx, "")
+                if not api_token or not username:
+                    continue
+                st = get_kernel_state(username, f"tdv-node-{node_id}", api_token)
+                if st in ("running", "queued", "cancelrequested"):
+                    still_running.append(node_id)
+                    delete_kernel_if_exists(
+                        username=username,
+                        slug=f"tdv-node-{node_id}",
+                        api_token=api_token,
+                        wait_if_running=False,
+                    )
+            pending_nodes = still_running
+            if pending_nodes:
+                print(
+                    f"[FleetManager] Waiting 5s for {len(pending_nodes)} deleted node(s) "
+                    f"({pending_nodes}) to finish stopping on Kaggle...",
+                    flush=True,
+                )
+                time.sleep(5)
 
 
 def default_fleet_state(phase: str = "initial", run_tag: str = "INITIAL") -> dict[str, Any]:
@@ -293,7 +329,7 @@ def default_fleet_state(phase: str = "initial", run_tag: str = "INITIAL") -> dic
     }
 
 
-def load_and_sync_fleet_state(bucket: BucketClient) -> dict[str, Any]:
+def load_and_sync_fleet_state(bucket: BucketClient, sync_logs: bool = True) -> dict[str, Any]:
     """
     Load `control/state.json` from the HF Bucket and reconcile it against
     `log/NODE_{i}/{run_tag}/COMPLETED` markers present in the bucket.
@@ -309,15 +345,45 @@ def load_and_sync_fleet_state(bucket: BucketClient) -> dict[str, Any]:
     for i in range(TOTAL_NOTEBOOKS):
         nodes.setdefault(str(i), {"status": "IDLE", "retries": 0, "updated_at": now_iso})
 
-    if phase != "standby":
+    if sync_logs and phase != "standby":
         try:
             log_paths = bucket.list_paths(prefix="log", recursive=True)
             for i in range(TOTAL_NOTEBOOKS):
                 marker = f"log/NODE_{i}/{run_tag}/COMPLETED"
-                if marker in log_paths and nodes[str(i)].get("status") != "DONE":
-                    nodes[str(i)]["status"] = "DONE"
-                    nodes[str(i)]["retries"] = 0
-                    nodes[str(i)]["updated_at"] = now_iso
+                n_rec = nodes[str(i)]
+                if marker in log_paths or n_rec.get("status") == "DONE":
+                    if n_rec.get("integrity_verified") == run_tag:
+                        n_rec["status"] = "DONE"
+                        n_rec["retries"] = 0
+                        continue
+                    try:
+                        missing_cnt = count_node_missing_tasks(bucket, i, run_tag)
+                    except Exception as ver_exc:
+                        print(
+                            f"[FleetManager] Warning: could not verify integrity for Node {i}: {ver_exc}",
+                            flush=True,
+                        )
+                        missing_cnt = 0
+                    if missing_cnt == 0:
+                        n_rec["status"] = "DONE"
+                        n_rec["retries"] = 0
+                        n_rec["integrity_verified"] = run_tag
+                        n_rec["updated_at"] = now_iso
+                    else:
+                        print(
+                            f"[FleetManager] Integrity check for Node {i} ({run_tag}): "
+                            f"{missing_cnt} task(s) missing or had transient network error! "
+                            f"Deleting premature COMPLETED marker so Node {i} heals missing symbols.",
+                            flush=True,
+                        )
+                        if marker in log_paths:
+                            try:
+                                bucket.delete_paths([marker])
+                            except Exception:
+                                pass
+                        n_rec["status"] = "IDLE"
+                        n_rec.pop("integrity_verified", None)
+                        n_rec["updated_at"] = now_iso
         except Exception as exc:
             print(f"[FleetManager] Warning: could not list log markers: {exc}", flush=True)
 
@@ -550,6 +616,7 @@ def push_worker_node(
     usernames: dict[int, str],
     start_delay_seconds: int = 0,
     wait_if_running: bool = False,
+    force_push: bool = False,
 ) -> bool:
     """Push `tdv-node-{node_id}` to its assigned Kaggle account."""
     acc_idx = get_account_index_for_node(node_id)
@@ -566,7 +633,7 @@ def push_worker_node(
     else:
         k_state = get_kernel_state(username, slug, api_token)
 
-    if k_state in ("running", "queued"):
+    if not force_push and k_state in ("running", "queued"):
         print(f"[FleetManager] {username}/{slug} is already '{k_state}'. Skipping duplicate push.", flush=True)
         state["nodes"][str(node_id)]["status"] = "RUNNING"
         return True
@@ -581,8 +648,10 @@ def push_worker_node(
     )
     ok = _push_kernel_via_cli(username, slug, title, script_code, api_token)
     if ok:
+        now_iso = datetime.now(timezone.utc).isoformat()
         state["nodes"][str(node_id)]["status"] = "RUNNING"
-        state["nodes"][str(node_id)]["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state["nodes"][str(node_id)]["launched_at"] = now_iso
+        state["nodes"][str(node_id)]["updated_at"] = now_iso
     return ok
 
 
@@ -635,6 +704,7 @@ def reconcile_fleet(
     state: dict[str, Any],
     tokens: list[str],
     usernames: dict[int, str],
+    force_push: bool = False,
 ) -> None:
     """
     Reconcile all 20 worker nodes (or `tdv-standby` when in `standby` phase).
@@ -684,18 +754,83 @@ def reconcile_fleet(
         uname = usernames.get(acc_idx, "")
         live_k = get_kernel_state(uname, f"tdv-node-{i}", tok)
 
-        if live_k in ("running", "queued"):
+        if not force_push and live_k in ("running", "queued"):
             node_info["status"] = "RUNNING"
             continue
 
         print(
-            f"[FleetManager] Reconciling Node {i} (stored={status}, live={live_k}) -> pushing kernel...",
+            f"[FleetManager] Reconciling Node {i} (stored={status}, live={live_k}, force={force_push}) -> pushing kernel...",
             flush=True,
         )
-        push_worker_node(i, state, tokens, usernames, start_delay_seconds=0, wait_if_running=False)
+        push_worker_node(
+            i,
+            state,
+            tokens,
+            usernames,
+            start_delay_seconds=0,
+            wait_if_running=False,
+            force_push=force_push,
+        )
         time.sleep(2)
 
     save_fleet_state(bucket, state)
+
+
+def _is_stale_teardown_callback(
+    node_id: int,
+    cb: str,
+    node_rec: dict[str, Any],
+    tokens: list[str],
+    usernames: dict[int, str],
+    now_utc: datetime,
+) -> bool:
+    """
+    Detect if a `TIMEOUT`, `ERROR`, or `RATE_LIMITED` callback was emitted by a dying
+    old container that was just replaced by `TRIGGER_WEEKLY` (or a recent push).
+    """
+    launched_str = str(node_rec.get("launched_at", "")).strip()
+    if not launched_str:
+        return False
+    try:
+        launched_dt = datetime.fromisoformat(launched_str)
+        age_sec = (now_utc - launched_dt).total_seconds()
+    except Exception:
+        return False
+
+    acc_idx = get_account_index_for_node(node_id)
+    tok = tokens[acc_idx] if acc_idx < len(tokens) else ""
+    uname = usernames.get(acc_idx, "")
+    if not tok or not uname:
+        return False
+
+    slug = f"tdv-node-{node_id}"
+    # 1. A real 11h 45m TIMEOUT cannot occur within 30 minutes of launch
+    if cb == "TIMEOUT" and age_sec < 1800:
+        live_k = get_kernel_state(uname, slug, tok)
+        if live_k in ("running", "queued"):
+            print(
+                f"[FleetManager] Ignoring stale {cb} callback for Node {node_id} "
+                f"(new kernel was launched {age_sec:.0f}s ago and is currently '{live_k}').",
+                flush=True,
+            )
+            return True
+
+    # 2. If an ERROR/RATE_LIMITED arrives within 5 minutes of a fresh launch while the
+    #    new kernel is still running after a 15s grace check, it came from the killed old container
+    if cb in ("ERROR", "RATE_LIMITED") and age_sec < 300:
+        live_k = get_kernel_state(uname, slug, tok)
+        if live_k in ("running", "queued"):
+            time.sleep(15)
+            live_k_after = get_kernel_state(uname, slug, tok)
+            if live_k_after in ("running", "queued"):
+                print(
+                    f"[FleetManager] Ignoring stale {cb} callback for Node {node_id} "
+                    f"(new kernel was launched {age_sec:.0f}s ago and remains '{live_k_after}').",
+                    flush=True,
+                )
+                return True
+
+    return False
 
 
 def handle_node_callback(
@@ -735,8 +870,8 @@ def handle_node_callback(
     if cb == "TRIGGER_WEEKLY":
         week_tag = compute_weekly_run_tag(now_utc)
         print(
-            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby & old worker notebooks, "
-            f"then starting {week_tag} across all 20 nodes!",
+            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby, old worker notebooks, "
+            f"and any existing {week_tag} logs, then starting {week_tag} across all 20 nodes!",
             flush=True,
         )
         if tokens and usernames.get(0):
@@ -746,12 +881,23 @@ def handle_node_callback(
                 api_token=tokens[0],
                 wait_if_running=True,
             )
-        delete_all_worker_kernels(tokens, usernames, wait_if_running=False)
+        delete_all_worker_kernels(tokens, usernames, wait_if_running=False, verify_stopped=True)
+        try:
+            all_log_paths = bucket.list_paths(prefix="log", recursive=True)
+            week_log_paths = [p for p in all_log_paths if f"/{week_tag}/" in p]
+            if week_log_paths:
+                print(
+                    f"[FleetManager] Deleting {len(week_log_paths)} existing {week_tag} log file(s) from bucket...",
+                    flush=True,
+                )
+                bucket.delete_paths(week_log_paths)
+        except Exception as exc:
+            print(f"[FleetManager] Warning: could not purge old {week_tag} logs: {exc}", flush=True)
         new_state = default_fleet_state(phase=week_tag, run_tag=week_tag)
         state.clear()
         state.update(new_state)
         save_fleet_state(bucket, state)
-        reconcile_fleet(bucket, state, tokens, usernames)
+        reconcile_fleet(bucket, state, tokens, usernames, force_push=True)
         return
 
     # 2. Worker Node Callbacks (0..19)
@@ -759,11 +905,51 @@ def handle_node_callback(
     node_rec = state["nodes"].setdefault(
         node_key, {"status": "IDLE", "retries": 0, "updated_at": now_iso}
     )
+
+    if cb in ("TIMEOUT", "ERROR", "RATE_LIMITED") and _is_stale_teardown_callback(
+        node_id, cb, node_rec, tokens, usernames, now_utc
+    ):
+        return
+
     node_rec["updated_at"] = now_iso
 
     if cb == "DONE":
+        phase_str = str(state.get("phase", "initial"))
+        run_tag_str = str(state.get("run_tag", "INITIAL" if phase_str == "initial" else phase_str))
+        try:
+            missing_cnt = count_node_missing_tasks(bucket, node_id, run_tag_str)
+        except Exception as ver_exc:
+            print(f"[FleetManager] Warning: integrity check error on Node {node_id}: {ver_exc}", flush=True)
+            missing_cnt = 0
+
+        if missing_cnt > 0:
+            print(
+                f"[FleetManager] Node {node_id} reported DONE but has {missing_cnt} incomplete/transient "
+                f"task(s) in {run_tag_str}! Deleting COMPLETED marker and re-pushing continuation to heal...",
+                flush=True,
+            )
+            try:
+                bucket.delete_paths([f"log/NODE_{node_id}/{run_tag_str}/COMPLETED"])
+            except Exception:
+                pass
+            node_rec["status"] = "IDLE"
+            node_rec.pop("integrity_verified", None)
+            save_fleet_state(bucket, state)
+            push_worker_node(
+                node_id,
+                state,
+                tokens,
+                usernames,
+                start_delay_seconds=0,
+                wait_if_running=True,
+            )
+            save_fleet_state(bucket, state)
+            reconcile_fleet(bucket, state, tokens, usernames)
+            return
+
         node_rec["status"] = "DONE"
         node_rec["retries"] = 0
+        node_rec["integrity_verified"] = run_tag_str
         save_fleet_state(bucket, state)
 
         if all(state["nodes"][str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
@@ -908,7 +1094,11 @@ def main() -> int:
     bucket = BucketClient()
     tokens = load_kaggle_tokens()
     usernames = resolve_all_usernames(tokens)
-    state = load_and_sync_fleet_state(bucket)
+    is_trigger_weekly = str(args.callback_status or "").strip().upper() == "TRIGGER_WEEKLY"
+    state = load_and_sync_fleet_state(
+        bucket,
+        sync_logs=not (is_trigger_weekly or bool(args.reset_phase)),
+    )
 
     if args.reset_phase:
         target = args.reset_phase.strip()
