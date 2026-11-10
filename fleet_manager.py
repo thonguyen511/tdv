@@ -742,7 +742,10 @@ def reconcile_fleet(
         if status == "AUTH_FAILED":
             print(f"[FleetManager] Node {i} is marked AUTH_FAILED. Skipping until credentials fixed.", flush=True)
             continue
-        if retries > MAX_CONSECUTIVE_NODE_FAILURES:
+        if status == "IDLE" and retries >= MAX_CONSECUTIVE_NODE_FAILURES:
+            retries = 0
+            node_info["retries"] = 0
+        if not force_push and retries > MAX_CONSECUTIVE_NODE_FAILURES:
             print(
                 f"[FleetManager] Node {i} exceeded max consecutive failures ({retries}). Skipping.",
                 flush=True,
@@ -923,27 +926,39 @@ def handle_node_callback(
             missing_cnt = 0
 
         if missing_cnt > 0:
-            print(
-                f"[FleetManager] Node {node_id} reported DONE but has {missing_cnt} incomplete/transient "
-                f"task(s) in {run_tag_str}! Deleting COMPLETED marker and re-pushing continuation to heal...",
-                flush=True,
-            )
+            retries = int(node_rec.get("retries", 0)) + 1
+            node_rec["status"] = "IDLE"
+            node_rec["retries"] = retries
+            node_rec.pop("integrity_verified", None)
             try:
                 bucket.delete_paths([f"log/NODE_{node_id}/{run_tag_str}/COMPLETED"])
             except Exception:
                 pass
-            node_rec["status"] = "IDLE"
-            node_rec.pop("integrity_verified", None)
             save_fleet_state(bucket, state)
-            push_worker_node(
-                node_id,
-                state,
-                tokens,
-                usernames,
-                start_delay_seconds=0,
-                wait_if_running=True,
-            )
-            save_fleet_state(bucket, state)
+            if retries <= MAX_CONSECUTIVE_NODE_FAILURES:
+                print(
+                    f"[FleetManager] Node {node_id} reported DONE but has {missing_cnt} incomplete/transient "
+                    f"task(s) in {run_tag_str} (heal attempt {retries}/{MAX_CONSECUTIVE_NODE_FAILURES})! "
+                    f"Deleting COMPLETED marker and re-pushing continuation to heal...",
+                    flush=True,
+                )
+                push_worker_node(
+                    node_id,
+                    state,
+                    tokens,
+                    usernames,
+                    start_delay_seconds=0,
+                    wait_if_running=True,
+                )
+                save_fleet_state(bucket, state)
+            else:
+                node_rec["status"] = "ERROR"
+                save_fleet_state(bucket, state)
+                print(
+                    f"[FleetManager] Node {node_id} reported DONE with {missing_cnt} incomplete task(s) "
+                    f"but exceeded max heal attempts ({retries}/{MAX_CONSECUTIVE_NODE_FAILURES}). Stopping loop.",
+                    flush=True,
+                )
             reconcile_fleet(bucket, state, tokens, usernames)
             return
 
@@ -1120,7 +1135,8 @@ def main() -> int:
         return 0
 
     if args.push_node is not None:
-        push_worker_node(args.push_node, state, tokens, usernames, wait_if_running=True)
+        state["nodes"].setdefault(str(args.push_node), {})["retries"] = 0
+        push_worker_node(args.push_node, state, tokens, usernames, wait_if_running=True, force_push=True)
         save_fleet_state(bucket, state)
         return 0
 

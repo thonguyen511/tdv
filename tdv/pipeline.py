@@ -517,14 +517,7 @@ def run_node_pipeline(
                 # 1D did not complete (e.g. unexpected drop); do not run Stage 2 or mark INTRADAY skipped
                 continue
             meta = ctx.symbol_metadata.get(sym, {})
-            if meta.get("symbol_error", False):
-                if (sym, STAGE1_INTERVAL) in completed_pairs or any(
-                    s == sym and iv == STAGE1_INTERVAL and not _is_transient_failure_reason(r)
-                    for s, iv, r in ctx.failure_logs
-                ):
-                    failed_1d_symbols.add(sym)
-                    for dead_iv in ALL_INTERVALS:
-                        completed_pairs.add((sym, dead_iv))
+            if sym in failed_1d_symbols or meta.get("symbol_error", False):
                 continue
 
             sym_is_futures = is_futures_exchange or sym.endswith("1!") or sym.endswith("2!")
@@ -647,12 +640,23 @@ def run_node_pipeline(
         bucket.upload_files_batch(batch_uploads)
 
     # 7. Data Flow Integrity Verification before marking COMPLETED
+    cp_disk_text = (
+        local_checkpoint.read_text(encoding="utf-8", errors="replace")
+        if local_checkpoint.exists()
+        else ""
+    )
+    fl_disk_text = (
+        local_failures.read_text(encoding="utf-8", errors="replace")
+        if local_failures.exists()
+        else ""
+    )
+    _, _, verified_completed_pairs, _, _ = _reconcile_resumed_logs(cp_disk_text, fl_disk_text)
     missing_tasks_count = sum(
         1
         for chunk in assignments
         for sym in chunk.symbols
         for iv in ALL_INTERVALS
-        if (sym, iv) not in completed_pairs
+        if (sym, iv) not in verified_completed_pairs
     )
     if missing_tasks_count > 0:
         print(
