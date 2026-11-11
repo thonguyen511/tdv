@@ -36,6 +36,7 @@ from tdv.config import (
     DEFAULT_GITHUB_REPO,
     DEFAULT_HF_BUCKET_ID,
     ERROR_COOLDOWN_SECONDS,
+    MAX_ALLOWED_MISSING_RATE_PCT,
     MAX_CONSECUTIVE_NODE_FAILURES,
     NODES_PER_KAGGLE_ACCOUNT,
     RATE_LIMIT_COOLDOWN_SECONDS,
@@ -43,7 +44,7 @@ from tdv.config import (
     TOTAL_NOTEBOOKS,
     compute_weekly_run_tag,
 )
-from tdv.pipeline import count_node_missing_tasks
+from tdv.pipeline import count_node_missing_tasks, count_node_task_stats
 
 KAGGLE_API_BASE = "https://www.kaggle.com/api/v1"
 
@@ -351,28 +352,38 @@ def load_and_sync_fleet_state(bucket: BucketClient, sync_logs: bool = True) -> d
             for i in range(TOTAL_NOTEBOOKS):
                 marker = f"log/NODE_{i}/{run_tag}/COMPLETED"
                 n_rec = nodes[str(i)]
-                if marker in log_paths or n_rec.get("status") == "DONE":
-                    if n_rec.get("integrity_verified") == run_tag:
+                if marker in log_paths or n_rec.get("status") in ("DONE", "ERROR"):
+                    if n_rec.get("integrity_verified") == run_tag and n_rec.get("status") == "DONE":
                         n_rec["status"] = "DONE"
                         n_rec["retries"] = 0
                         continue
                     try:
-                        missing_cnt = count_node_missing_tasks(bucket, i, run_tag)
+                        missing_cnt, total_tasks, missing_rate_pct = count_node_task_stats(bucket, i, run_tag)
                     except Exception as ver_exc:
                         print(
                             f"[FleetManager] Warning: could not verify integrity for Node {i}: {ver_exc}",
                             flush=True,
                         )
-                        missing_cnt = 0
-                    if missing_cnt == 0:
+                        missing_cnt, total_tasks, missing_rate_pct = 0, 0, 0.0
+
+                    n_rec["missing_tasks"] = missing_cnt
+                    n_rec["total_tasks"] = total_tasks
+                    n_rec["missing_rate_pct"] = missing_rate_pct
+
+                    if missing_rate_pct <= MAX_ALLOWED_MISSING_RATE_PCT:
                         n_rec["status"] = "DONE"
                         n_rec["retries"] = 0
                         n_rec["integrity_verified"] = run_tag
                         n_rec["updated_at"] = now_iso
+                        if marker not in log_paths:
+                            try:
+                                bucket.upload_bytes(marker, datetime.now(timezone.utc).isoformat().encode("utf-8"))
+                            except Exception:
+                                pass
                     else:
                         print(
                             f"[FleetManager] Integrity check for Node {i} ({run_tag}): "
-                            f"{missing_cnt} task(s) missing or had transient network error! "
+                            f"{missing_cnt}/{total_tasks} task(s) missing ({missing_rate_pct:.3f}% > {MAX_ALLOWED_MISSING_RATE_PCT}%)! "
                             f"Deleting premature COMPLETED marker so Node {i} heals missing symbols.",
                             flush=True,
                         )
@@ -381,8 +392,9 @@ def load_and_sync_fleet_state(bucket: BucketClient, sync_logs: bool = True) -> d
                                 bucket.delete_paths([marker])
                             except Exception:
                                 pass
-                        n_rec["status"] = "IDLE"
-                        n_rec.pop("integrity_verified", None)
+                        if n_rec.get("status") == "DONE":
+                            n_rec["status"] = "IDLE"
+                            n_rec.pop("integrity_verified", None)
                         n_rec["updated_at"] = now_iso
         except Exception as exc:
             print(f"[FleetManager] Warning: could not list log markers: {exc}", flush=True)
@@ -920,12 +932,16 @@ def handle_node_callback(
         phase_str = str(state.get("phase", "initial"))
         run_tag_str = str(state.get("run_tag", "INITIAL" if phase_str == "initial" else phase_str))
         try:
-            missing_cnt = count_node_missing_tasks(bucket, node_id, run_tag_str)
+            missing_cnt, total_tasks, missing_rate_pct = count_node_task_stats(bucket, node_id, run_tag_str)
         except Exception as ver_exc:
             print(f"[FleetManager] Warning: integrity check error on Node {node_id}: {ver_exc}", flush=True)
-            missing_cnt = 0
+            missing_cnt, total_tasks, missing_rate_pct = 0, 0, 0.0
 
-        if missing_cnt > 0:
+        node_rec["missing_tasks"] = missing_cnt
+        node_rec["total_tasks"] = total_tasks
+        node_rec["missing_rate_pct"] = missing_rate_pct
+
+        if missing_rate_pct > MAX_ALLOWED_MISSING_RATE_PCT:
             retries = int(node_rec.get("retries", 0)) + 1
             node_rec["status"] = "IDLE"
             node_rec["retries"] = retries
@@ -937,8 +953,8 @@ def handle_node_callback(
             save_fleet_state(bucket, state)
             if retries <= MAX_CONSECUTIVE_NODE_FAILURES:
                 print(
-                    f"[FleetManager] Node {node_id} reported DONE but has {missing_cnt} incomplete/transient "
-                    f"task(s) in {run_tag_str} (heal attempt {retries}/{MAX_CONSECUTIVE_NODE_FAILURES})! "
+                    f"[FleetManager] Node {node_id} reported DONE but has {missing_cnt}/{total_tasks} incomplete "
+                    f"tasks ({missing_rate_pct:.3f}% > {MAX_ALLOWED_MISSING_RATE_PCT}%) in {run_tag_str} (heal attempt {retries}/{MAX_CONSECUTIVE_NODE_FAILURES})! "
                     f"Deleting COMPLETED marker and re-pushing continuation to heal...",
                     flush=True,
                 )
@@ -955,8 +971,8 @@ def handle_node_callback(
                 node_rec["status"] = "ERROR"
                 save_fleet_state(bucket, state)
                 print(
-                    f"[FleetManager] Node {node_id} reported DONE with {missing_cnt} incomplete task(s) "
-                    f"but exceeded max heal attempts ({retries}/{MAX_CONSECUTIVE_NODE_FAILURES}). Stopping loop.",
+                    f"[FleetManager] Node {node_id} reported DONE with {missing_cnt}/{total_tasks} incomplete tasks "
+                    f"({missing_rate_pct:.3f}%) but exceeded max heal attempts ({retries}/{MAX_CONSECUTIVE_NODE_FAILURES}). Stopping loop.",
                     flush=True,
                 )
             reconcile_fleet(bucket, state, tokens, usernames)
@@ -1039,6 +1055,46 @@ def handle_node_callback(
         return
 
     # Default: ERROR
+    phase_str = str(state.get("phase", "initial"))
+    run_tag_str = str(state.get("run_tag", "INITIAL" if phase_str == "initial" else phase_str))
+    try:
+        missing_cnt, total_tasks, missing_rate_pct = count_node_task_stats(bucket, node_id, run_tag_str)
+    except Exception:
+        missing_cnt, total_tasks, missing_rate_pct = 0, 0, 0.0
+
+    node_rec["missing_tasks"] = missing_cnt
+    node_rec["total_tasks"] = total_tasks
+    node_rec["missing_rate_pct"] = missing_rate_pct
+
+    # If within tolerance (< 2%), promote to DONE!
+    if total_tasks > 0 and missing_rate_pct <= MAX_ALLOWED_MISSING_RATE_PCT:
+        print(
+            f"[FleetManager] Node {node_id} reported ERROR but missing rate is {missing_rate_pct:.3f}% "
+            f"({missing_cnt}/{total_tasks} <= {MAX_ALLOWED_MISSING_RATE_PCT}%). Accepting as DONE within tolerance!",
+            flush=True,
+        )
+        node_rec["status"] = "DONE"
+        node_rec["retries"] = 0
+        node_rec["integrity_verified"] = run_tag_str
+        try:
+            bucket.upload_bytes(f"log/NODE_{node_id}/{run_tag_str}/COMPLETED", datetime.now(timezone.utc).isoformat().encode("utf-8"))
+        except Exception:
+            pass
+        save_fleet_state(bucket, state)
+        if all(state["nodes"][str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
+            print(
+                f"[FleetManager] All {TOTAL_NOTEBOOKS} nodes are now DONE! "
+                "Deleting finished worker notebooks, transitioning to 'standby', and launching tdv-standby.",
+                flush=True,
+            )
+            delete_all_worker_kernels(tokens, usernames, wait_if_running=True)
+            state["phase"] = "standby"
+            push_standby_node(state, tokens, usernames, wait_if_running=False)
+            save_fleet_state(bucket, state)
+            return
+        reconcile_fleet(bucket, state, tokens, usernames)
+        return
+
     retries = int(node_rec.get("retries", 0)) + 1
     node_rec["status"] = "ERROR"
     node_rec["retries"] = retries
@@ -1082,10 +1138,12 @@ def print_fleet_status(
             n_info = state.get("nodes", {}).get(str(node_id), {})
             b_status = n_info.get("status", "IDLE")
             retries = n_info.get("retries", 0)
+            miss_pct = n_info.get("missing_rate_pct")
+            miss_str = f"({miss_pct:.2f}% miss)" if miss_pct is not None and miss_pct > 0 else ""
             live_k = get_kernel_state(uname, f"tdv-node-{node_id}", tok) if tok and uname != "<unconfigured>" else "n/a"
             print(
                 f"  Node {node_id:02d} (tdv-node-{node_id:<2d}) | "
-                f"Bucket: {b_status:<12s} | Kaggle: {live_k:<10s} | Retries: {retries}"
+                f"Bucket: {b_status:<8s} {miss_str:<13s} | Kaggle: {live_k:<10s} | Retries: {retries}"
             )
 
     if tokens and usernames.get(0):

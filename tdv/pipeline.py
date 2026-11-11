@@ -44,6 +44,7 @@ from tdv.config import (
     EXIT_OK,
     EXIT_RATE_LIMITED,
     INTRADAY_INTERVALS,
+    MAX_ALLOWED_MISSING_RATE_PCT,
     STAGE1_INTERVAL,
     STAGE2_MACRO_INTERVALS,
     TOTAL_WORKERS,
@@ -201,17 +202,16 @@ def _reconcile_resumed_logs(
     return cleaned_cp, cleaned_fl, completed_pairs, known_intraday, failed_1d_symbols
 
 
-def count_node_missing_tasks(
+def count_node_task_stats(
     bucket: BucketClient,
     notebook_id: int,
     run_tag: str,
     map_path: Path | None = None,
     data_dir: Path | None = None,
-) -> int:
+) -> tuple[int, int, float]:
     """
     Download `checkpoint.log` and `failures.log` for `(notebook_id, run_tag)` from
-    the bucket and return the exact number of `(symbol, interval)` tasks across all
-    assigned chunks that are missing or failed with a transient network/socket error.
+    the bucket and return `(missing_tasks_count, total_tasks_count, missing_rate_pct)`.
     """
     repo_root = get_repo_root()
     resolved_map_path = map_path or (repo_root / "map.json")
@@ -232,13 +232,35 @@ def count_node_missing_tasks(
     fl_text = fl_bytes.decode("utf-8", errors="replace") if fl_bytes is not None else ""
     _, _, completed_pairs, _, _ = _reconcile_resumed_logs(cp_text, fl_text)
 
-    return sum(
+    total_tasks = sum(
+        len(chunk.symbols) * len(ALL_INTERVALS)
+        for chunk in assignments
+    )
+    missing_tasks = sum(
         1
         for chunk in assignments
         for sym in chunk.symbols
         for iv in ALL_INTERVALS
         if (sym, iv) not in completed_pairs
     )
+    missing_rate_pct = round((missing_tasks / total_tasks * 100.0), 4) if total_tasks > 0 else 0.0
+    return missing_tasks, total_tasks, missing_rate_pct
+
+
+def count_node_missing_tasks(
+    bucket: BucketClient,
+    notebook_id: int,
+    run_tag: str,
+    map_path: Path | None = None,
+    data_dir: Path | None = None,
+) -> int:
+    """
+    Download `checkpoint.log` and `failures.log` for `(notebook_id, run_tag)` from
+    the bucket and return the exact number of `(symbol, interval)` tasks across all
+    assigned chunks that are missing or failed with a transient network/socket error.
+    """
+    missing_cnt, _, _ = count_node_task_stats(bucket, notebook_id, run_tag, map_path, data_dir)
+    return missing_cnt
 
 
 def _merge_and_encrypt_interval_chunk(
@@ -651,6 +673,10 @@ def run_node_pipeline(
         else ""
     )
     _, _, verified_completed_pairs, _, _ = _reconcile_resumed_logs(cp_disk_text, fl_disk_text)
+    total_node_tasks = sum(
+        len(chunk.symbols) * len(ALL_INTERVALS)
+        for chunk in assignments
+    )
     missing_tasks_count = sum(
         1
         for chunk in assignments
@@ -658,19 +684,30 @@ def run_node_pipeline(
         for iv in ALL_INTERVALS
         if (sym, iv) not in verified_completed_pairs
     )
+    missing_rate_pct = round((missing_tasks_count / total_node_tasks * 100.0), 4) if total_node_tasks > 0 else 0.0
+
     if missing_tasks_count > 0:
-        print(
-            f"[Pipeline] Data Integrity Gate: {missing_tasks_count} symbol/interval task(s) "
-            f"are still incomplete for Node {notebook_id} ({effective_run_tag}). "
-            f"Not writing COMPLETED marker; returning EXIT_ERROR so FleetManager re-pushes continuation.",
-            flush=True,
-        )
-        return EXIT_ERROR
+        if missing_rate_pct <= MAX_ALLOWED_MISSING_RATE_PCT:
+            print(
+                f"[Pipeline] Data Integrity Gate: {missing_tasks_count}/{total_node_tasks} task(s) "
+                f"({missing_rate_pct:.3f}%) are incomplete for Node {notebook_id} ({effective_run_tag}). "
+                f"Within allowed error threshold ({MAX_ALLOWED_MISSING_RATE_PCT}%) -> writing COMPLETED marker.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Pipeline] Data Integrity Gate: {missing_tasks_count}/{total_node_tasks} symbol/interval task(s) "
+                f"({missing_rate_pct:.3f}% > {MAX_ALLOWED_MISSING_RATE_PCT}%) are still incomplete for Node {notebook_id} ({effective_run_tag}). "
+                f"Not writing COMPLETED marker; returning EXIT_ERROR so FleetManager re-pushes continuation.",
+                flush=True,
+            )
+            return EXIT_ERROR
 
     completed_ts = datetime.now(timezone.utc).isoformat().encode("utf-8")
     bucket.upload_bytes(remote_completed_path, completed_ts)
     print(
-        f"[Pipeline] Node {notebook_id} verified 100% complete across all {len(assignments)} chunks for {effective_run_tag}! "
+        f"[Pipeline] Node {notebook_id} verified {total_node_tasks - missing_tasks_count}/{total_node_tasks} "
+        f"tasks complete ({100.0 - missing_rate_pct:.3f}%) for {effective_run_tag}! "
         f"Marker written to {remote_completed_path}.",
         flush=True,
     )

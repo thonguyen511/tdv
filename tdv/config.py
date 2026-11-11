@@ -62,6 +62,9 @@ DEFAULT_TIMEOUT_SECONDS = 42300
 RATE_LIMIT_COOLDOWN_SECONDS = 900   # 15 minutes
 ERROR_COOLDOWN_SECONDS = 300        # 5 minutes
 MAX_CONSECUTIVE_NODE_FAILURES = 6
+# Maximum allowed missing/error task rate (percentage) for a node to be considered complete.
+# E.g. 2.0% allows up to 2% dead/delisted/socket-reset symbols to be tolerated.
+MAX_ALLOWED_MISSING_RATE_PCT = 2.0
 
 # ---------------------------------------------------------------------------
 # Supervisor / Worker Process Exit Codes
