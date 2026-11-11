@@ -1141,6 +1141,13 @@ def main() -> int:
         return 0
 
     if args.push_standby:
+        run_tag_str = str(state.get("run_tag", "WEEKLY"))
+        print(f"[FleetManager] Manual standby triggered for {run_tag_str} -> cleaning worker kernels and launching tdv-standby...", flush=True)
+        delete_all_worker_kernels(tokens, usernames, wait_if_running=False)
+        for i in range(TOTAL_NOTEBOOKS):
+            state["nodes"].setdefault(str(i), {})["status"] = "DONE"
+            state["nodes"][str(i)]["retries"] = 0
+            state["nodes"][str(i)]["integrity_verified"] = run_tag_str
         state["phase"] = "standby"
         push_standby_node(state, tokens, usernames, wait_if_running=True)
         save_fleet_state(bucket, state)
