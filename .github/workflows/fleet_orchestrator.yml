@@ -48,6 +48,7 @@ jobs:
       TV_EMAILS_JSON: ${{ secrets.TV_EMAILS_JSON }}
       TV_ULTIMATE_SESSIONID: ${{ secrets.TV_ULTIMATE_SESSIONID }}
       TV_ULTIMATE_SESSIONID_SIGN: ${{ secrets.TV_ULTIMATE_SESSIONID_SIGN }}
+      TV_PREMIUM_WS_URL: ${{ secrets.TV_PREMIUM_WS_URL }}
 
     steps:
       - name: Checkout repository

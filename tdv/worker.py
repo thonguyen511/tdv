@@ -3,18 +3,29 @@ Persistent WebSocket Worker Pool for Two-Stage Chunk Execution.
 
 Implements:
 - Persistent WebSocket connections per worker thread (reused across tasks by
-  creating/deleting `chart_create_session` and `quote_create_session` on the
-  open socket, matching `run_first/worker_pool.py` and `run_weekly/event_fetcher.py`).
-- Stage 1 (`1D`):
-  - Non-futures: Quote Session (`quote_set_fields` `["base_name", "last_splits"]`)
-    + Chart Studies (`Dividends`, `Earnings` with `{}`).
-  - Futures (`is_futures=True`): Chart Studies (`st_roll_a` with `{"currenttime": "now"}`
-    and `st_roll_b` with `{}` on `BarSetContinuousRollDates`).
-  - Waits for `main_series_completed` AND `required_studies.issubset(completed_studies)`.
-  - Captures `has_intraday` from `symbol_resolved`.
+  creating/deleting `chart_create_session`, `quote_create_session`, and
+  optional `replay_create_session` on the open socket).
+- Stage 1 (`1D` + Universal Studies + `has_intraday` Filtering):
+  - Runs ALL studies for EVERY ticker extracted from the input CSV (no asset-type
+    filtering so nothing is omitted):
+    - Quote Session (`quote_set_fields` `["base_name", "short_name", "last_splits"]`)
+    - Chart Studies: `Splits`, `Dividends`, `Earnings`, and `BarSetContinuousRollDates`
+      (`st_roll_a` with `{"currenttime": "now"}` and `st_roll_b` with `{}`).
+  - Always requests `BARS_INITIAL_LOAD = 1_000_000` bars (TradingView WS API
+    automatically applies the cap associated with the active JWT).
+  - If a premium cookie/JWT is available during the `initial` job, Phase 1 (`1D`)
+    also runs on the premium endpoint for comprehensive studies & full depth.
+  - Captures `has_intraday` and `is_replayable` from `symbol_resolved`.
 - Stage 2 (`1W`, `1M`, and `has_intraday`-filtered intraday `1, 5, 15, 60, 240`):
-  - Backwards paging via `request_more_data` in Phase 1 (`fetch_full_history=True`).
-  - Single-batch fetch in Phase 2 (`fetch_full_history=False`).
+  - Initial job (`fetch_full_history=True`):
+    - Pages backwards via `request_more_data` (`1_000_000`).
+    - When a premium cookie/JWT is active on intraday intervals, runs WebSocket
+      Bar Replay backwards stepping (`_fetch_older_intraday_via_replay`) modeled on
+      `ref/TradingView-API/src/chart/session.js` to extend intraday history further back.
+  - Weekly job (`fetch_full_history=False`):
+    - Always runs with Free cookies/JWTs (`has_ultimate=False`).
+    - Requests `1_000_000` bars in a single batch; TradingView returns the Free
+      JWT's capped recent bars overlapping the previous week.
   - Attaches corporate actions (`raw_split`, `raw_dividend`, `raw_earnings`, `raw_roll`)
     to all intervals via `attach_events_to_df`.
 """
@@ -34,7 +45,19 @@ import numpy as np
 import pandas as pd
 import websocket
 
-from tdv.config import BARS_INITIAL_LOAD, BARS_MORE_LOAD, MAX_HISTORY_BATCHES, MAX_TASK_RETRIES
+from tdv.config import (
+    BARS_INITIAL_LOAD,
+    BARS_MORE_LOAD,
+    INTRADAY_INTERVALS,
+    MAX_HISTORY_BATCHES,
+    MAX_REPLAY_BATCHES,
+    MAX_TASK_RETRIES,
+    STATUS_ERR_EMPTY,
+    STATUS_ERR_SYMBOL,
+    STATUS_ERR_TRANSIENT,
+    STATUS_OK,
+    get_ws_url,
+)
 from tdv.jwt_manager import JWTManager, TVAuthError
 from tdv.protocol import (
     DEFAULT_STUDY_SCRIPTS,
@@ -55,13 +78,14 @@ class TaskItem:
 
 @dataclass
 class ChunkExecutionContext:
-    """Shared state for a single 2,000-symbol chunk across the 8-worker pool."""
+    """Shared state for a chunk across the 8-worker pool."""
 
     fetch_full_history: bool
     study_scripts: dict[str, str]
     jwt_manager: JWTManager
     has_ultimate: bool = False
     ultimate_jwt: str | None = None
+    enable_bar_replay: bool = True
 
     # Queues
     primary_queue: queue.Queue[TaskItem | None] = field(default_factory=queue.Queue)
@@ -73,7 +97,8 @@ class ChunkExecutionContext:
     symbol_events: dict[str, dict[str, Any]] = field(default_factory=dict)
     symbol_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
     success_logs: list[tuple[str, str, str]] = field(default_factory=list)
-    failure_logs: list[tuple[str, str, str]] = field(default_factory=list)
+    # `(symbol, interval, status_code, reason)` where status_code in {E1, E2, E4}
+    failure_logs: list[tuple[str, str, str, str]] = field(default_factory=list)
     network_retry_tasks: list[TaskItem] = field(default_factory=list)
 
     # Abort / Auth flags
@@ -82,10 +107,10 @@ class ChunkExecutionContext:
     consecutive_429_errors: int = 0
 
 
-def _connect_ws(endpoint: str, jwt_token: str, timeout: int = 15) -> websocket.WebSocket:
-    """Open a TradingView WebSocket connection and authenticate with `jwt_token`."""
+def _connect_ws(ws_url: str, jwt_token: str, timeout: int = 15) -> websocket.WebSocket:
+    """Open a TradingView WebSocket connection to `ws_url` and authenticate with `jwt_token`."""
     ws = websocket.create_connection(
-        f"wss://{endpoint}/socket.io/websocket?from=chart%2F&type=chart",
+        ws_url,
         header=[
             "Origin: https://www.tradingview.com",
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -98,11 +123,208 @@ def _connect_ws(endpoint: str, jwt_token: str, timeout: int = 15) -> websocket.W
     return ws
 
 
+def _fetch_older_intraday_via_replay(
+    ws: websocket.WebSocket,
+    ws_buffer: str,
+    symbol: str,
+    interval: str,
+    bars: dict[float, list[Any]],
+    ctx: ChunkExecutionContext,
+) -> tuple[str, bool]:
+    """
+    Extend intraday history backwards using TradingView's Bar Replay WebSocket protocol
+    (derived from `ref/TradingView-API/src/chart/session.js`):
+      1. `replay_create_session` -> `[replay_session]`
+      2. `replay_add_series`     -> `[replay_session, "req_replay_addseries", "={...}", interval]`
+      3. `replay_reset`          -> `[replay_session, "req_replay_reset", cursor_ts]`
+      4. `chart_create_session` + `resolve_symbol` with `{"replay": replay_session, "symbol": ...}`
+      5. `create_series` (`BARS_INITIAL_LOAD`) + `request_more_data` backwards inside each replay window.
+
+    Steps `cursor_ts` backwards to `min(bars.keys()) - 1` until `replay_data_end`,
+    no older bars arrive, or `MAX_REPLAY_BATCHES` is reached.
+    Returns `(updated_ws_buffer, auth_failed)`.
+    """
+    if not bars:
+        return ws_buffer, False
+
+    symbol_init = {"symbol": symbol, "adjustment": "none"}
+
+    for _ in range(MAX_REPLAY_BATCHES):
+        if ctx.abort_event.is_set() or ctx.auth_failed_event.is_set():
+            break
+
+        oldest_ts = min(bars.keys())
+        cursor_ts = int(oldest_ts) - 1
+        if cursor_ts <= 0:
+            break
+
+        replay_session = generate_session_id("rs")
+        chart_session = generate_session_id("cs_rp")
+        series_id = "sds_rp"
+        sym_id = "sds_rp_sym"
+
+        replay_ended = False
+        added_older = False
+        auth_failed = False
+
+        try:
+            ws.send(create_ws_message("replay_create_session", [replay_session]))
+            ws.send(
+                create_ws_message(
+                    "replay_add_series",
+                    [replay_session, "req_replay_addseries", f"={json.dumps(symbol_init)}", interval],
+                )
+            )
+            ws.send(
+                create_ws_message(
+                    "replay_reset",
+                    [replay_session, "req_replay_reset", cursor_ts],
+                )
+            )
+            ws.send(create_ws_message("chart_create_session", [chart_session, ""]))
+            ws.send(
+                create_ws_message(
+                    "resolve_symbol",
+                    [
+                        chart_session,
+                        sym_id,
+                        f"={json.dumps({'replay': replay_session, 'symbol': symbol_init})}",
+                    ],
+                )
+            )
+            ws.send(
+                create_ws_message(
+                    "create_series",
+                    [chart_session, series_id, "s1", sym_id, interval, BARS_INITIAL_LOAD, ""],
+                )
+            )
+
+            prev_count = len(bars)
+            local_batches = 0
+            last_wait = time.time()
+
+            while True:
+                if ctx.abort_event.is_set() or ctx.auth_failed_event.is_set():
+                    replay_ended = True
+                    break
+                if time.time() - last_wait > 20.0:
+                    replay_ended = True
+                    break
+
+                try:
+                    ws.settimeout(3.0)
+                    raw_msg = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception:
+                    replay_ended = True
+                    break
+
+                if not raw_msg:
+                    replay_ended = True
+                    break
+
+                ws_buffer += raw_msg
+                messages, ws_buffer = parse_ws_messages(ws_buffer)
+                done_window = False
+
+                for msg in messages:
+                    if msg.startswith("~h~"):
+                        ws.send(f"~m~{len(msg)}~m~{msg}")
+                        continue
+                    if not msg.startswith("{"):
+                        continue
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+
+                    last_wait = time.time()
+                    m_type = data.get("m")
+                    params = data.get("p", [])
+
+                    if m_type == "replay_data_end" and params and params[0] == replay_session:
+                        replay_ended = True
+                        done_window = True
+                        break
+
+                    if (
+                        m_type in ("timescale_update", "du")
+                        and len(params) >= 2
+                        and params[0] == chart_session
+                        and isinstance(params[1], dict)
+                    ):
+                        s_list = params[1].get(series_id, {}).get("s", [])
+                        for item in s_list:
+                            v = item.get("v")
+                            if v and len(v) >= 5:
+                                if v[0] < oldest_ts:
+                                    added_older = True
+                                bars[v[0]] = [
+                                    v[0],
+                                    v[1],
+                                    v[2],
+                                    v[3],
+                                    v[4],
+                                    v[5] if len(v) > 5 else 0.0,
+                                ]
+
+                    elif m_type == "series_completed" and params and params[0] == chart_session:
+                        cur_count = len(bars)
+                        if cur_count > prev_count and local_batches < 50:
+                            prev_count = cur_count
+                            local_batches += 1
+                            ws.send(
+                                create_ws_message(
+                                    "request_more_data",
+                                    [chart_session, series_id, BARS_MORE_LOAD],
+                                )
+                            )
+                        else:
+                            done_window = True
+                            break
+
+                    elif m_type in ("symbol_error", "series_error") and params and params[0] == chart_session:
+                        replay_ended = True
+                        done_window = True
+                        break
+
+                    elif m_type in ("critical_error", "error"):
+                        err_str = str(params).lower()
+                        if "auth" in err_str or "token" in err_str or "permission" in err_str:
+                            auth_failed = True
+                        replay_ended = True
+                        done_window = True
+                        break
+
+                if done_window:
+                    break
+        except Exception:
+            replay_ended = True
+        finally:
+            try:
+                ws.send(create_ws_message("chart_delete_session", [chart_session]))
+            except Exception:
+                pass
+            try:
+                ws.send(create_ws_message("replay_delete_session", [replay_session]))
+            except Exception:
+                pass
+
+        if auth_failed:
+            return ws_buffer, True
+        if replay_ended or not added_older:
+            break
+
+    return ws_buffer, False
+
+
 def _execute_task_on_ws(
     ws: websocket.WebSocket,
     ws_buffer: str,
     task: TaskItem,
     ctx: ChunkExecutionContext,
+    is_ultimate_worker: bool = False,
 ) -> tuple[
     str,
     str,
@@ -118,32 +340,31 @@ def _execute_task_on_ws(
         `(status, error_reason, updated_ws_buffer, bars_dict, raw_events, resolved_meta)`
         where `status` is one of:
         - `"OK"`: Completed normally
-        - `"SYMBOL_ERROR"`: Definitive TradingView symbol/series error (do not retry)
+        - `"SYMBOL_ERROR"`: Definitive TradingView symbol/series error (`E1`)
         - `"AUTH_ERROR"`: JWT expired or rejected (`critical_error` / auth error)
-        - `"NETWORK_ERROR"`: Socket closed or timed out (reconnect and retry)
+        - `"NETWORK_ERROR"`: Socket closed or timed out (`E4`, retried)
     """
     symbol = task.symbol
     interval = task.interval
     is_1d = interval == "1D"
-    is_futures = task.is_futures or symbol.endswith("1!") or symbol.endswith("2!")
 
     chart_session = generate_session_id("cs")
-    quote_session = generate_session_id("qs") if (is_1d and not is_futures) else None
+    quote_session = generate_session_id("qs") if is_1d else None
     series_id = "sds_1"
     sym_id = "sds_sym_1"
 
-    # 1. Quote session for fast stock splits on 1D (`quote_set_fields` uses flat args!)
+    # 1. Quote session on 1D for EVERY ticker (splits via last_splits)
     if is_1d and quote_session:
         ws.send(create_ws_message("quote_create_session", [quote_session]))
         ws.send(
             create_ws_message(
                 "quote_set_fields",
-                [quote_session, "base_name", "last_splits"],
+                [quote_session, "base_name", "short_name", "last_splits"],
             )
         )
         ws.send(create_ws_message("quote_add_symbols", [quote_session, symbol]))
 
-    # 2. Chart session for unadjusted OHLCV bars & event studies
+    # 2. Chart session for unadjusted OHLCV bars (`1,000,000` requested; WS API caps to JWT limit)
     ws.send(create_ws_message("chart_create_session", [chart_session, ""]))
     resolve_config = json.dumps({"symbol": symbol, "adjustment": "none"})
     ws.send(
@@ -159,47 +380,52 @@ def _execute_task_on_ws(
         )
     )
 
-    # 3. Add Event Studies on 1D probe (matching `run_first/worker_pool.py`)
+    # 3. Universal Studies on 1D for EVERY ticker (no asset-type filtering)
     required_studies: set[str] = set()
     completed_studies: set[str] = set()
 
+    split_script = ctx.study_scripts.get("splits", DEFAULT_STUDY_SCRIPTS["splits"])
     div_script = ctx.study_scripts.get("dividends", DEFAULT_STUDY_SCRIPTS["dividends"])
     earn_script = ctx.study_scripts.get("earnings", DEFAULT_STUDY_SCRIPTS["earnings"])
     roll_script = ctx.study_scripts.get("rolls", DEFAULT_STUDY_SCRIPTS["rolls"])
 
     if is_1d:
-        if not is_futures:
-            ws.send(
-                create_ws_message(
-                    "create_study",
-                    [chart_session, "st_div", "st1", series_id, div_script, {}],
-                )
+        ws.send(
+            create_ws_message(
+                "create_study",
+                [chart_session, "st_split", "st1", series_id, split_script, {}],
             )
-            ws.send(
-                create_ws_message(
-                    "create_study",
-                    [chart_session, "st_earn", "st1", series_id, earn_script, {}],
-                )
+        )
+        ws.send(
+            create_ws_message(
+                "create_study",
+                [chart_session, "st_div", "st1", series_id, div_script, {}],
             )
-            required_studies.update(["st_div", "st_earn"])
-        else:
-            ws.send(
-                create_ws_message(
-                    "create_study",
-                    [chart_session, "st_roll_a", "st1", series_id, roll_script, {"currenttime": "now"}],
-                )
+        )
+        ws.send(
+            create_ws_message(
+                "create_study",
+                [chart_session, "st_earn", "st1", series_id, earn_script, {}],
             )
-            ws.send(
-                create_ws_message(
-                    "create_study",
-                    [chart_session, "st_roll_b", "st2", series_id, roll_script, {}],
-                )
+        )
+        ws.send(
+            create_ws_message(
+                "create_study",
+                [chart_session, "st_roll_a", "st1", series_id, roll_script, {"currenttime": "now"}],
             )
-            required_studies.update(["st_roll_a", "st_roll_b"])
+        )
+        ws.send(
+            create_ws_message(
+                "create_study",
+                [chart_session, "st_roll_b", "st2", series_id, roll_script, {}],
+            )
+        )
+        required_studies.update(["st_split", "st_div", "st_earn", "st_roll_a", "st_roll_b"])
 
     bars: dict[float, list[Any]] = {}
     raw_events: dict[str, list[Any]] = {
         "splits": [],
+        "splits_study": [],
         "dividends": [],
         "earnings": [],
         "rolls": [],
@@ -223,13 +449,12 @@ def _execute_task_on_ws(
 
         now_ts = time.time()
         if is_1d and main_series_completed and series_completed_at is not None and (now_ts - series_completed_at > 6.0):
-            # Main 1D series completed >6s ago; don't let a silent study hang mutual funds/indices
+            # Main 1D series completed >6s ago; don't let an inactive study hang indices/funds
             status = "OK"
             break
 
         if now_ts - last_wait > 25.0:
             if bars and main_series_completed:
-                # Series already completed; don't discard valid bars if a study timed out
                 status = "OK"
             else:
                 status = "NETWORK_ERROR"
@@ -309,6 +534,7 @@ def _execute_task_on_ws(
                 if isinstance(meta, dict):
                     resolved_meta["has_intraday"] = bool(meta.get("has_intraday", True))
                     resolved_meta["has_adjustment"] = bool(meta.get("has_adjustment", False))
+                    resolved_meta["is_replayable"] = bool(meta.get("is_replayable", True))
 
             # Capture Bars and Studies (`params[0] == chart_session`)
             elif (
@@ -332,6 +558,10 @@ def _execute_task_on_ws(
                                 v[5] if len(v) > 5 else 0.0,
                             ]
                 if is_1d:
+                    if "st_split" in payload_dict:
+                        st = payload_dict["st_split"].get("st", [])
+                        if st:
+                            raw_events["splits_study"].extend(st)
                     if "st_div" in payload_dict:
                         st = payload_dict["st_div"].get("st", [])
                         if st:
@@ -352,7 +582,7 @@ def _execute_task_on_ws(
                 and params[0] == chart_session
             ):
                 current_count = len(bars)
-                if ctx.fetch_full_history and not is_1d:
+                if ctx.fetch_full_history:
                     if (
                         current_count > prev_bar_count
                         and current_count > 0
@@ -371,7 +601,7 @@ def _execute_task_on_ws(
                         if series_completed_at is None:
                             series_completed_at = time.time()
                 else:
-                    # 1D initial load (2,000,000 bars covers all 1D history in 1 batch) or Weekly Phase 2
+                    # Weekly job: single 1,000,000-bar request capped by Free JWT overlapping prior week
                     main_series_completed = True
                     if series_completed_at is None:
                         series_completed_at = time.time()
@@ -423,6 +653,28 @@ def _execute_task_on_ws(
         except Exception:
             pass
 
+    # Initial job + Premium cookie on intraday: extend history backwards via Bar Replay
+    if (
+        status == "OK"
+        and bars
+        and ctx.fetch_full_history
+        and ctx.enable_bar_replay
+        and is_ultimate_worker
+        and interval in INTRADAY_INTERVALS
+        and resolved_meta.get("is_replayable", True)
+    ):
+        ws_buffer, replay_auth_failed = _fetch_older_intraday_via_replay(
+            ws=ws,
+            ws_buffer=ws_buffer,
+            symbol=symbol,
+            interval=interval,
+            bars=bars,
+            ctx=ctx,
+        )
+        if replay_auth_failed:
+            status = "AUTH_ERROR"
+            error_reason = "Auth error during Bar Replay"
+
     return status, error_reason, ws_buffer, bars, raw_events, resolved_meta
 
 
@@ -461,11 +713,10 @@ def _worker_thread_loop(
     ctx: ChunkExecutionContext,
 ) -> None:
     """
-    Worker loop servicing tasks from `ctx.primary_queue` (and `ctx.intraday_queue`
-    when running in dual Ultimate + Free mode).
+    Worker loop servicing tasks from `ctx.primary_queue` and `ctx.intraday_queue`.
     """
     is_ultimate_worker = role == "ultimate" and ctx.has_ultimate and bool(ctx.ultimate_jwt)
-    endpoint = "prodata.tradingview.com" if is_ultimate_worker else "data.tradingview.com"
+    ws_url = get_ws_url(is_premium=is_ultimate_worker)
 
     ws: websocket.WebSocket | None = None
     ws_buffer = ""
@@ -499,10 +750,13 @@ def _worker_thread_loop(
                 task = ctx.primary_queue.get_nowait()
                 picked_queue = ctx.primary_queue
             except queue.Empty:
-                try:
-                    task = ctx.intraday_queue.get_nowait()
-                    picked_queue = ctx.intraday_queue
-                except queue.Empty:
+                if not ctx.has_ultimate:
+                    try:
+                        task = ctx.intraday_queue.get_nowait()
+                        picked_queue = ctx.intraday_queue
+                    except queue.Empty:
+                        break
+                else:
                     break
 
         if task is None:
@@ -528,7 +782,7 @@ def _worker_thread_loop(
                     break
 
                 try:
-                    ws = _connect_ws(endpoint, jwt_tok)
+                    ws = _connect_ws(ws_url, jwt_tok)
                     ws_buffer = ""
                     with ctx.results_lock:
                         ctx.consecutive_429_errors = 0
@@ -558,7 +812,7 @@ def _worker_thread_loop(
                                     "symbol_error": True,
                                 }
                             ctx.failure_logs.append(
-                                (task.symbol, task.interval, f"Connect failed: {conn_exc}")
+                                (task.symbol, task.interval, STATUS_ERR_TRANSIENT, f"Connect failed: {conn_exc}")
                             )
                     continue
 
@@ -570,19 +824,19 @@ def _worker_thread_loop(
                     bars,
                     raw_events,
                     resolved_meta,
-                ) = _execute_task_on_ws(ws, ws_buffer, task, ctx)
+                ) = _execute_task_on_ws(
+                    ws=ws,
+                    ws_buffer=ws_buffer,
+                    task=task,
+                    ctx=ctx,
+                    is_ultimate_worker=is_ultimate_worker,
+                )
             except Exception as send_exc:
-                # `ws.send()` on a socket the server already closed raises
-                # BrokenPipeError / WebSocketConnectionClosedException. Treat it as a
-                # transient NETWORK_ERROR so the thread survives and the task is retried
-                # instead of silently killing the worker and dropping the task.
                 status = "NETWORK_ERROR"
                 error_reason = f"Socket send error: {type(send_exc).__name__}: {send_exc}"
                 bars, raw_events, resolved_meta = {}, {}, {}
 
-            # If a reused persistent socket was closed by the server between tasks
-            # (BrokenPipeError on send or immediate EOF on recv), immediately reconnect
-            # a fresh socket and retry the task in-place without burning `task.retries`.
+            # Reconnect once in-place if a reused persistent socket was closed between tasks
             if (
                 status == "NETWORK_ERROR"
                 and reused_socket
@@ -598,7 +852,7 @@ def _worker_thread_loop(
                         if is_ultimate_worker and ctx.ultimate_jwt
                         else ctx.jwt_manager.get_jwt(force_refresh=False)
                     )
-                    ws = _connect_ws(endpoint, jwt_tok)
+                    ws = _connect_ws(ws_url, jwt_tok)
                     ws_buffer = ""
                     (
                         status,
@@ -607,7 +861,13 @@ def _worker_thread_loop(
                         bars,
                         raw_events,
                         resolved_meta,
-                    ) = _execute_task_on_ws(ws, ws_buffer, task, ctx)
+                    ) = _execute_task_on_ws(
+                        ws=ws,
+                        ws_buffer=ws_buffer,
+                        task=task,
+                        ctx=ctx,
+                        is_ultimate_worker=is_ultimate_worker,
+                    )
                 except TVAuthError as auth_exc:
                     print(f"[Worker-{worker_id}] {auth_exc}", flush=True)
                     ctx.auth_failed_event.set()
@@ -642,7 +902,7 @@ def _worker_thread_loop(
                                 "symbol_error": True,
                             }
                         ctx.failure_logs.append(
-                            (task.symbol, task.interval, f"Auth error: {error_reason}")
+                            (task.symbol, task.interval, STATUS_ERR_TRANSIENT, f"Auth error: {error_reason}")
                         )
                 continue
 
@@ -662,7 +922,7 @@ def _worker_thread_loop(
                                 "symbol_error": True,
                             }
                         ctx.failure_logs.append(
-                            (task.symbol, task.interval, f"Network error: {error_reason}")
+                            (task.symbol, task.interval, STATUS_ERR_TRANSIENT, f"Network error: {error_reason}")
                         )
                 continue
 
@@ -675,7 +935,7 @@ def _worker_thread_loop(
                             "symbol_error": True,
                         }
                     ctx.failure_logs.append(
-                        (task.symbol, task.interval, f"Symbol error: {error_reason}")
+                        (task.symbol, task.interval, STATUS_ERR_SYMBOL, f"Symbol error: {error_reason}")
                     )
                 continue
 
@@ -687,13 +947,14 @@ def _worker_thread_loop(
                         ctx.symbol_metadata[task.symbol] = {
                             "has_intraday": bool(resolved_meta.get("has_intraday", True)),
                             "has_adjustment": bool(resolved_meta.get("has_adjustment", False)),
+                            "is_replayable": bool(resolved_meta.get("is_replayable", True)),
                             "symbol_error": False,
                         }
                     else:
-                        # 1D returned 0 bars (series_completed_but_empty) -> skip Stage 2 for this empty symbol
                         ctx.symbol_metadata[task.symbol] = {
                             "has_intraday": False,
                             "has_adjustment": False,
+                            "is_replayable": False,
                             "symbol_error": True,
                         }
                 events_for_sym = raw_events
@@ -710,10 +971,12 @@ def _worker_thread_loop(
                 )
                 with ctx.results_lock:
                     ctx.chunk_dfs.setdefault(task.interval, []).append(df_sym)
-                    ctx.success_logs.append((task.symbol, task.interval, "OK"))
+                    ctx.success_logs.append((task.symbol, task.interval, STATUS_OK))
             else:
                 with ctx.results_lock:
-                    ctx.failure_logs.append((task.symbol, task.interval, "series_completed_but_empty"))
+                    ctx.failure_logs.append(
+                        (task.symbol, task.interval, STATUS_ERR_EMPTY, "series_completed_but_empty")
+                    )
 
         finally:
             if picked_queue is not None:
@@ -729,8 +992,19 @@ def run_task_batch_with_retries(
     ultimate_workers: int = 5,
 ) -> None:
     """
-    Execute a batch of `TaskItem`s across the 8-worker pool, automatically
-    retrying transient `NETWORK_ERROR` tasks up to `MAX_TASK_RETRIES` rounds.
+    Execute a batch of `TaskItem`s across the worker pool, automatically retrying
+    transient `NETWORK_ERROR` tasks up to `MAX_TASK_RETRIES` rounds.
+
+    Routing:
+    - When `ctx.has_ultimate` and `ctx.fetch_full_history` (`initial` job with
+      a premium cookie):
+      - `1D` (Phase 1) and `intraday` (`1..240`) tasks go to `ctx.intraday_queue`
+        and run strictly on the premium/ultimate workers so `1D` studies and
+        intraday replay both benefit from the premium account.
+      - `1W` / `1M` go to `ctx.primary_queue` (serviced by free workers and
+        assisted by ultimate workers once `intraday_queue` drains).
+    - Otherwise (Weekly job or Initial job without premium cookie):
+      - All `total_workers` run as Free-pool workers on `ctx.primary_queue`.
     """
     pending = list(tasks)
     round_num = 0
@@ -739,31 +1013,38 @@ def run_task_batch_with_retries(
         round_num += 1
         ctx.network_retry_tasks.clear()
 
+        has_primary_work = False
+        has_premium_work = False
+
         for item in pending:
-            if ctx.has_ultimate and item.interval not in ("1D", "1W", "1M"):
+            if ctx.has_ultimate and ctx.fetch_full_history and item.interval in ("1D", *INTRADAY_INTERVALS):
                 ctx.intraday_queue.put(item)
+                has_premium_work = True
             else:
                 ctx.primary_queue.put(item)
+                has_primary_work = True
 
         threads: list[threading.Thread] = []
-        if ctx.has_ultimate:
-            free_count = max(1, total_workers - ultimate_workers)
-            for i in range(ultimate_workers):
-                t = threading.Thread(
-                    target=_worker_thread_loop,
-                    args=(i, "ultimate", ctx),
-                    daemon=True,
-                )
-                t.start()
-                threads.append(t)
-            for i in range(free_count):
-                t = threading.Thread(
-                    target=_worker_thread_loop,
-                    args=(ultimate_workers + i, "free", ctx),
-                    daemon=True,
-                )
-                t.start()
-                threads.append(t)
+        if ctx.has_ultimate and ctx.fetch_full_history:
+            if has_premium_work:
+                for i in range(ultimate_workers):
+                    t = threading.Thread(
+                        target=_worker_thread_loop,
+                        args=(i, "ultimate", ctx),
+                        daemon=True,
+                    )
+                    t.start()
+                    threads.append(t)
+            if has_primary_work:
+                free_count = max(1, total_workers - ultimate_workers)
+                for i in range(free_count):
+                    t = threading.Thread(
+                        target=_worker_thread_loop,
+                        args=(ultimate_workers + i, "free", ctx),
+                        daemon=True,
+                    )
+                    t.start()
+                    threads.append(t)
         else:
             for i in range(total_workers):
                 t = threading.Thread(

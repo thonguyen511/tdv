@@ -40,30 +40,36 @@ class ChunkAssignment:
     symbols: list[str]
 
 
-def get_symbols_from_file(file_path: str | Path) -> list[str]:
+def get_symbol_groups_from_file(file_path: str | Path) -> list[tuple[str, list[str]]]:
     """
-    Extract full `EXCHANGE:SYMBOL` tickers from a CSV file, expanding futures
-    `contracts` (`f"{prefix}:{c['symbol']}"`) when present.
+    Extract ordered `(root_symbol_key, [expanded_tickers...])` groups from a CSV file.
+    Each row in the CSV yields one group:
+    - If `contracts` is present and non-empty, `expanded_tickers` are the contract
+      tickers `f"{prefix}:{c['symbol']}"` in order.
+    - Otherwise, `expanded_tickers` is `[f"{exchange_code}:{symbol}"]`.
     """
-    symbols: list[str] = []
+    groups: list[tuple[str, list[str]]] = []
+    seen_tickers: set[str] = set()
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:
-                return symbols
+                return groups
             try:
                 ex_idx = header.index("exchange_code")
                 sym_idx = header.index("symbol")
                 contracts_idx = header.index("contracts") if "contracts" in header else -1
             except ValueError:
-                return symbols
+                return groups
 
             for row in reader:
                 if len(row) > max(ex_idx, sym_idx):
+                    ex_code = row[ex_idx].strip()
                     base_symbol = row[sym_idx].strip()
                     if not base_symbol:
                         continue
+                    root_key = f"{ex_code}:{base_symbol}"
                     extracted_symbols: list[str] = []
 
                     if contracts_idx != -1 and len(row) > contracts_idx:
@@ -74,19 +80,35 @@ def get_symbols_from_file(file_path: str | Path) -> list[str]:
                                 if isinstance(contracts_list, list) and len(contracts_list) > 0:
                                     for c in contracts_list:
                                         if isinstance(c, dict) and c.get("symbol"):
-                                            prefix = str(c.get("prefix", row[ex_idx].strip())).strip()
+                                            prefix = str(c.get("prefix", ex_code)).strip()
                                             extracted_symbols.append(f"{prefix}:{c['symbol']}")
                             except Exception:
                                 pass
 
                     if not extracted_symbols:
-                        extracted_symbols.append(f"{row[ex_idx].strip()}:{base_symbol}")
+                        extracted_symbols.append(root_key)
 
+                    dedup_group: list[str] = []
                     for sym in extracted_symbols:
-                        symbols.append(sym)
+                        if sym not in seen_tickers:
+                            seen_tickers.add(sym)
+                            dedup_group.append(sym)
+                    if dedup_group:
+                        groups.append((root_key, dedup_group))
     except Exception as exc:
         print(f"[MapPlanner] ERROR reading {file_path}: {exc}", flush=True)
-    return list(dict.fromkeys(symbols))
+    return groups
+
+
+def get_symbols_from_file(file_path: str | Path) -> list[str]:
+    """
+    Extract full `EXCHANGE:SYMBOL` tickers from a CSV file, expanding futures
+    `contracts` (`f"{prefix}:{c['symbol']}"`) when present.
+    """
+    symbols: list[str] = []
+    for _, group_syms in get_symbol_groups_from_file(file_path):
+        symbols.extend(group_syms)
+    return symbols
 
 
 # Alias for backwards compatibility inside tdv

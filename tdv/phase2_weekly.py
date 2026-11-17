@@ -1,10 +1,10 @@
 """
-Phase 2: Weekly Incremental Maintenance (`WEEK_<WWYY>`).
+Weekly Job (`WEEK_<WWYY>` Incremental Maintenance).
 
-Fetches the latest batch of bars per symbol/interval, downloads the existing
-`.parquet.enc` chunk from the Hugging Face Storage Bucket, decrypts and
-overwrite-merges deduplicated by `["symbol", "time"]`, re-encrypts, and uploads
-in place (no git history bloat or `super_squash_history` needed).
+Always uses Free cookies/JWTs (no premium cookie needed after the initial run).
+Requests `1,000,000` bars per series (TradingView caps to the Free JWT limit,
+overlapping the previous week), overwrite-merges deduplicated by `["symbol", "time"]`,
+re-encrypts in place, and updates the `WEEK_<WWYY>` column in `log/node_{i}_{yyyy}.csv`.
 """
 
 from __future__ import annotations

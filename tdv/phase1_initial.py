@@ -1,9 +1,10 @@
 """
-Phase 1: Initial Full Historical Scan (`INITIAL`).
+Initial Job (`INITIAL` Full Historical Scan).
 
-Loops `request_more_data` backwards up to `MAX_HISTORY_BATCHES` per series and
-writes encrypted `.parquet.enc` chunks + `log/NODE_{i}/INITIAL/` logs to the
-Hugging Face Storage Bucket.
+Uses the Premium/Ultimate cookie/JWT when available (both Phase 1 `1D` + studies
+and Phase 2 intraday Bar Replay), falling back cleanly to Free workers during
+testing. Requests `1,000,000` bars and writes encrypted `.parquet.enc` chunks +
+per-node yearly CSV logs (`log/node_{i}_{yyyy}.csv`) to the HF Storage Bucket.
 """
 
 from __future__ import annotations

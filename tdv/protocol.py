@@ -6,6 +6,7 @@ metadata resolution, and vectorized corporate-action / roll attachment
 
 from __future__ import annotations
 
+import base64
 import json
 import random
 import re
@@ -91,9 +92,26 @@ def verify_cookie_tier(
         jwt_token = jwt_match.group(1) if jwt_match else None
         if not jwt_token or jwt_token == "unauthorized_user_token":
             return False, None, "Free"
+
+        # Decode JWT payload to check `plan` when available
+        jwt_plan = ""
+        try:
+            parts = jwt_token.split(".")
+            if len(parts) == 3:
+                pad = "=" * ((4 - len(parts[1]) % 4) % 4)
+                payload = json.loads(base64.urlsafe_b64decode((parts[1] + pad).encode("ascii")).decode("utf-8"))
+                jwt_plan = str(payload.get("plan", "")).strip().lower()
+        except Exception:
+            pass
+
+        pro_plan_match = re.search(r'"pro_plan"\s*:\s*"([^"]*)"', resp.text)
+        pro_plan_val = pro_plan_match.group(1).strip().lower() if pro_plan_match else ""
+
         is_pro = bool(
             re.search(r'"is_pro"\s*:\s*true', resp.text)
             or "prodata.tradingview.com" in resp.text
+            or (pro_plan_val and pro_plan_val not in ("free", "none", "null"))
+            or (jwt_plan and jwt_plan not in ("free", "none", "null"))
         )
         return True, jwt_token, ("Ultimate" if is_pro else "Free")
     except Exception:
@@ -101,6 +119,7 @@ def verify_cookie_tier(
 
 
 DEFAULT_STUDY_SCRIPTS: dict[str, str] = {
+    "splits": "Splits@tv-basicstudies-281",
     "dividends": "Dividends@tv-basicstudies-281",
     "earnings": "Earnings@tv-basicstudies-281",
     "rolls": "BarSetContinuousRollDates@tv-corestudies-50",
@@ -111,11 +130,12 @@ def resolve_live_study_descriptors(jwt_token: str = "", max_attempts: int = 3) -
     """
     Query TradingView's live `request_studies_metadata` endpoint at startup
     (with up to `max_attempts` retries) to dynamically resolve the latest study
-    version numbers for Dividends, Earnings, and Continuous Roll Dates.
+    version numbers for Splits, Dividends, Earnings, and Continuous Roll Dates.
     Falls back to `DEFAULT_STUDY_SCRIPTS` only if all attempts fail.
     """
     scripts = dict(DEFAULT_STUDY_SCRIPTS)
     targets: dict[str, str] = {
+        "Splits@tv-basicstudies-": "splits",
         "Dividends@tv-basicstudies-": "dividends",
         "Earnings@tv-basicstudies-": "earnings",
         "BarSetContinuousRollDates@tv-corestudies-": "rolls",
@@ -258,6 +278,21 @@ def attach_events_to_df(
                 idx = find_target_idx(sp_ts)
                 if idx is not None:
                     df.iat[idx, df.columns.get_loc("raw_split")] = sp_factor
+            except Exception:
+                pass
+
+    # 1b. Splits from Chart Study (`Splits@tv-basicstudies`): v = [bar_ts, denominator, numerator, split_date_ms]
+    for sp_st in raw_events.get("splits_study", []):
+        v = sp_st.get("v", []) if isinstance(sp_st, dict) else []
+        if len(v) >= 3 and v[2]:
+            try:
+                study_factor = float(v[1]) / float(v[2])
+                target_ts = (float(v[3]) / 1000.0) if (len(v) >= 4 and v[3]) else float(v[0])
+                idx = find_target_idx(target_ts)
+                if idx is None and v[0]:
+                    idx = find_target_idx(float(v[0]))
+                if idx is not None and pd.isna(df.iat[idx, df.columns.get_loc("raw_split")]):
+                    df.iat[idx, df.columns.get_loc("raw_split")] = study_factor
             except Exception:
                 pass
 

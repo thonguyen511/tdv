@@ -4,7 +4,8 @@ Distributed 20-Node Kaggle Fleet Orchestrator (`fleet_manager.py`).
 Key architectural improvements over `tdv_aio`:
 1. Stores orchestrator state in the Hugging Face Storage Bucket at `control/state.json`
    (eliminating git commit/rebase race conditions in GitHub Actions).
-2. Syncs `log/NODE_{i}/{run_tag}/COMPLETED` markers directly from the HF Bucket tree.
+2. Verifies per-node completion directly against yearly CSV logs (`log/node_{x}_{yyyy}.csv`)
+   in the HF Bucket (`1`, `E1`, `E2`, `E3` vs `""`/`E4`).
 3. Queries Kaggle's REST API (`/api/v1/kernels/status`) directly with JSON parsing
    instead of fragile CLI stdout substring matching.
 4. Waits up to 120s for a finishing Kaggle session to release its slot on `TIMEOUT`,
@@ -225,12 +226,34 @@ def delete_kernel_if_exists(
     if k_state == "not_found":
         return True
 
-    # 1. Try kagglesdk delete_kernel in-process
+    # 1. Try kagglesdk cancel_kernel_session (if running) + delete_kernel in-process
     try:
         from kagglesdk import KaggleClient
-        from kagglesdk.kernels.types.kernels_api_service import ApiDeleteKernelRequest
+        from kagglesdk.kernels.types.kernels_api_service import (
+            ApiCancelKernelSessionRequest,
+            ApiDeleteKernelRequest,
+            ApiGetKernelRequest,
+        )
 
         client = KaggleClient(api_token=api_token)
+        if k_state in ("running", "queued"):
+            try:
+                gk = ApiGetKernelRequest()
+                gk.user_name = username
+                gk.kernel_slug = slug
+                k_obj = client.kernels.kernels_api_client.get_kernel(gk)
+                sid = getattr(k_obj, "kernel_session_id", None) or getattr(
+                    getattr(k_obj, "metadata", None), "current_running_version_id", None
+                )
+                if sid:
+                    creq = ApiCancelKernelSessionRequest()
+                    creq.kernel_session_id = int(sid)
+                    client.kernels.kernels_api_client.cancel_kernel_session(creq)
+                    print(f"[FleetManager] Canceled running session {sid} for {username}/{slug}", flush=True)
+                    time.sleep(3)
+            except Exception as cancel_exc:
+                print(f"[FleetManager] cancel_kernel_session note for {username}/{slug}: {cancel_exc}", flush=True)
+
         req = ApiDeleteKernelRequest()
         req.user_name = username
         req.kernel_slug = slug
@@ -332,8 +355,8 @@ def default_fleet_state(phase: str = "initial", run_tag: str = "INITIAL") -> dic
 
 def load_and_sync_fleet_state(bucket: BucketClient, sync_logs: bool = True) -> dict[str, Any]:
     """
-    Load `control/state.json` from the HF Bucket and reconcile it against
-    `log/NODE_{i}/{run_tag}/COMPLETED` markers present in the bucket.
+    Load `control/state.json` from the HF Bucket and verify any `DONE`/`ERROR`
+    nodes against their yearly CSV logs (`log/node_{i}_{yyyy}.csv`).
     """
     state = bucket.read_json(BUCKET_STATE_PATH, default=None)
     if not state or "nodes" not in state:
@@ -348,11 +371,9 @@ def load_and_sync_fleet_state(bucket: BucketClient, sync_logs: bool = True) -> d
 
     if sync_logs and phase != "standby":
         try:
-            log_paths = bucket.list_paths(prefix="log", recursive=True)
             for i in range(TOTAL_NOTEBOOKS):
-                marker = f"log/NODE_{i}/{run_tag}/COMPLETED"
                 n_rec = nodes[str(i)]
-                if marker in log_paths or n_rec.get("status") in ("DONE", "ERROR"):
+                if n_rec.get("status") in ("DONE", "ERROR"):
                     if n_rec.get("integrity_verified") == run_tag and n_rec.get("status") == "DONE":
                         n_rec["status"] = "DONE"
                         n_rec["retries"] = 0
@@ -370,34 +391,24 @@ def load_and_sync_fleet_state(bucket: BucketClient, sync_logs: bool = True) -> d
                     n_rec["total_tasks"] = total_tasks
                     n_rec["missing_rate_pct"] = missing_rate_pct
 
-                    if missing_rate_pct <= MAX_ALLOWED_MISSING_RATE_PCT:
+                    if total_tasks > 0 and missing_rate_pct <= MAX_ALLOWED_MISSING_RATE_PCT:
                         n_rec["status"] = "DONE"
                         n_rec["retries"] = 0
                         n_rec["integrity_verified"] = run_tag
                         n_rec["updated_at"] = now_iso
-                        if marker not in log_paths:
-                            try:
-                                bucket.upload_bytes(marker, datetime.now(timezone.utc).isoformat().encode("utf-8"))
-                            except Exception:
-                                pass
                     else:
                         print(
                             f"[FleetManager] Integrity check for Node {i} ({run_tag}): "
                             f"{missing_cnt}/{total_tasks} task(s) missing ({missing_rate_pct:.3f}% > {MAX_ALLOWED_MISSING_RATE_PCT}%)! "
-                            f"Deleting premature COMPLETED marker so Node {i} heals missing symbols.",
+                            f"Marking Node {i} IDLE to heal missing symbols.",
                             flush=True,
                         )
-                        if marker in log_paths:
-                            try:
-                                bucket.delete_paths([marker])
-                            except Exception:
-                                pass
                         if n_rec.get("status") == "DONE":
                             n_rec["status"] = "IDLE"
                             n_rec.pop("integrity_verified", None)
                         n_rec["updated_at"] = now_iso
         except Exception as exc:
-            print(f"[FleetManager] Warning: could not list log markers: {exc}", flush=True)
+            print(f"[FleetManager] Warning: could not verify node CSV logs: {exc}", flush=True)
 
     return state
 
@@ -432,6 +443,16 @@ def build_worker_runner_script(
     ult_sign = os.environ.get("TV_ULTIMATE_SESSIONID_SIGN", "").strip()
 
     phase_mode = "initial" if phase == "initial" else "weekly"
+    # Premium cookie/WS URL are only used during the initial run
+    if phase_mode != "initial":
+        ult_session = ""
+        ult_sign = ""
+        ult_ws_url = ""
+    else:
+        ult_ws_url = (
+            os.environ.get("TV_PREMIUM_WS_URL", "").strip()
+            or os.environ.get("TV_ULTIMATE_WS_URL", "").strip()
+        )
 
     return f'''import os
 import shutil
@@ -454,6 +475,7 @@ os.environ["TV_SESSIONS_JSON"] = {json.dumps(tv_sessions_json)}
 os.environ["TV_EMAILS_JSON"] = {json.dumps(tv_emails_json)}
 os.environ["TV_ULTIMATE_SESSIONID"] = {json.dumps(ult_session)}
 os.environ["TV_ULTIMATE_SESSIONID_SIGN"] = {json.dumps(ult_sign)}
+os.environ["TV_PREMIUM_WS_URL"] = {json.dumps(ult_ws_url)}
 
 print("=== [TDV Runner] Bootstrapping Node {node_id} ({phase_mode} / {run_tag}) ===", flush=True)
 
@@ -534,7 +556,7 @@ if proc.returncode != 0 and os.environ.get("GH_PAT"):
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             }},
-            json={{"event_type": "kaggle_node_callback", "client_payload": {{"node_id": 99, "status": st, "phase": ph}}}},
+            json={{"event_type": "node_callback", "client_payload": {{"node_id": 99, "status": st, "phase": ph}}}},
             timeout=20,
         )
     except Exception:
@@ -885,8 +907,8 @@ def handle_node_callback(
     if cb == "TRIGGER_WEEKLY":
         week_tag = compute_weekly_run_tag(now_utc)
         print(
-            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby, old worker notebooks, "
-            f"and any existing {week_tag} logs, then starting {week_tag} across all 20 nodes!",
+            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby and old worker notebooks, "
+            f"then starting {week_tag} across all 20 nodes (appending {week_tag} column to yearly CSV logs)!",
             flush=True,
         )
         if tokens and usernames.get(0):
@@ -899,15 +921,11 @@ def handle_node_callback(
         delete_all_worker_kernels(tokens, usernames, wait_if_running=False, verify_stopped=True)
         try:
             all_log_paths = bucket.list_paths(prefix="log", recursive=True)
-            week_log_paths = [p for p in all_log_paths if f"/{week_tag}/" in p]
-            if week_log_paths:
-                print(
-                    f"[FleetManager] Deleting {len(week_log_paths)} existing {week_tag} log file(s) from bucket...",
-                    flush=True,
-                )
-                bucket.delete_paths(week_log_paths)
+            legacy_week_paths = [p for p in all_log_paths if f"/NODE_" in f"/{p}" and f"/{week_tag}/" in p]
+            if legacy_week_paths:
+                bucket.delete_paths(legacy_week_paths)
         except Exception as exc:
-            print(f"[FleetManager] Warning: could not purge old {week_tag} logs: {exc}", flush=True)
+            print(f"[FleetManager] Warning: could not check legacy {week_tag} logs: {exc}", flush=True)
         new_state = default_fleet_state(phase=week_tag, run_tag=week_tag)
         state.clear()
         state.update(new_state)
@@ -946,16 +964,12 @@ def handle_node_callback(
             node_rec["status"] = "IDLE"
             node_rec["retries"] = retries
             node_rec.pop("integrity_verified", None)
-            try:
-                bucket.delete_paths([f"log/NODE_{node_id}/{run_tag_str}/COMPLETED"])
-            except Exception:
-                pass
             save_fleet_state(bucket, state)
             if retries <= MAX_CONSECUTIVE_NODE_FAILURES:
                 print(
                     f"[FleetManager] Node {node_id} reported DONE but has {missing_cnt}/{total_tasks} incomplete "
                     f"tasks ({missing_rate_pct:.3f}% > {MAX_ALLOWED_MISSING_RATE_PCT}%) in {run_tag_str} (heal attempt {retries}/{MAX_CONSECUTIVE_NODE_FAILURES})! "
-                    f"Deleting COMPLETED marker and re-pushing continuation to heal...",
+                    f"Re-pushing continuation to heal...",
                     flush=True,
                 )
                 push_worker_node(
@@ -1076,10 +1090,6 @@ def handle_node_callback(
         node_rec["status"] = "DONE"
         node_rec["retries"] = 0
         node_rec["integrity_verified"] = run_tag_str
-        try:
-            bucket.upload_bytes(f"log/NODE_{node_id}/{run_tag_str}/COMPLETED", datetime.now(timezone.utc).isoformat().encode("utf-8"))
-        except Exception:
-            pass
         save_fleet_state(bucket, state)
         if all(state["nodes"][str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
             print(
@@ -1177,6 +1187,15 @@ def main() -> int:
         target = args.reset_phase.strip()
         r_tag = "INITIAL" if target.lower() == "initial" else target.upper()
         p_val = "initial" if target.lower() == "initial" else r_tag
+        if p_val == "initial":
+            if tokens and usernames.get(0):
+                delete_kernel_if_exists(
+                    username=usernames[0],
+                    slug="tdv-standby",
+                    api_token=tokens[0],
+                    wait_if_running=False,
+                )
+            delete_all_worker_kernels(tokens, usernames, wait_if_running=False, verify_stopped=True)
         state = default_fleet_state(phase=p_val, run_tag=r_tag)
         save_fleet_state(bucket, state)
         print(f"[FleetManager] Reset fleet state to phase={p_val}, run_tag={r_tag}", flush=True)

@@ -1,24 +1,23 @@
 # TDV — Distributed TradingView Data Pipeline
 
-Modular, two-phase, two-stage distributed market data pipeline across 20 Kaggle nodes, GitHub Actions event-driven orchestration (`repository_dispatch`), and Hugging Face Storage Buckets (`thonguyen511/temp`).
+Modular, two-stage distributed market data pipeline across 20 Kaggle nodes, GitHub Actions event-driven orchestration (`repository_dispatch`), and Hugging Face Storage Buckets (`thonguyen511/temp`).
 
 ## Architecture Highlights
 
-1. **Two-Phase Lifecycle**:
-   - **Phase 1 (`tdv.phase1_initial`)**: Full historical scan (`INITIAL`) paging backwards via `request_more_data` up to 1,000 batches per series.
-   - **Phase 2 (`tdv.phase2_weekly`)**: Weekly incremental maintenance (`WEEK_<WWYY>`) performing in-place encrypted chunk overwrite-merges on the Hugging Face Storage Bucket without git history bloat or `super_squash_history`.
+1. **Initial vs Weekly Jobs**:
+   - **Initial Job (`tdv.phase1_initial`, `INITIAL`)**: Uses the Premium cookie/JWT (`TV_ULTIMATE_SESSIONID` / `TV_ULTIMATE_SESSIONID_SIGN`) when available (both for Phase 1 `1D` + studies and Phase 2 intraday WebSocket Bar Replay), falling back cleanly to Free cookies when no premium cookie is configured yet.
+   - **Weekly Job (`tdv.phase2_weekly`, `WEEK_<WWYY>`)**: Uses Free cookies/JWTs only (no premium cookie required after the initial run). Always requests `1,000,000` bars per series; TradingView automatically caps to the JWT limit and returns recent bars that overlap and overwrite-merge in place with the previous week.
 
-2. **Two-Stage Per-Chunk Execution (`2,000` symbols/chunk, `8` workers/node)**:
-   - **Stage 1 (`1D` + Corporate Actions)**: Scrapes unadjusted (`adjustment="none"`) `1D` bars alongside dynamically versioned `Splits`, `Dividends`, `Earnings`, and `BarSetContinuousRollDates` studies, while capturing `has_intraday` and `has_adjustment` from `symbol_resolved`.
-   - **Stage 2 (`has_intraday` Filtering)**: Queues `1W` and `1M` for all valid symbols, and queues intraday intervals (`1`, `5`, `15`, `60`, `240`) strictly for symbols with `has_intraday == True`.
+2. **Two-Stage Per-Chunk Execution (`2,000` base symbols/chunk, `8` workers/node)**:
+   - **Stage 1 (`1D` + Universal Studies + `has_intraday` Filtering)**: Scrapes unadjusted (`adjustment="none"`) `1D` bars alongside `last_splits` (Quote) and all Chart Studies (`Splits`, `Dividends`, `Earnings`, `BarSetContinuousRollDates`) for **every** ticker in the CSV (no asset-type filtering), while capturing `has_intraday` and `is_replayable`.
+   - **Stage 2 (`1W`, `1M`, and `has_intraday`-Filtered Intraday)**: Queues `1W` and `1M` for all valid symbols, and queues intraday intervals (`1`, `5`, `15`, `60`, `240`) strictly where `has_intraday == True` (marking daily-only symbols `E3` in the log CSV).
 
-3. **Authenticated JWT Caching & Fail-Fast Security**:
-   - Persists encrypted per-node JWTs (`control/jwt/node_{0..19}.json.enc`) in the Hugging Face Bucket.
-   - Reuses the cached JWT until expiration or server rejection, refreshing via `sessionid` cookies or headless Playwright login only when needed.
+3. **Yearly Per-Node CSV Logging (`log/node_{x}_{yyyy}.csv`)**:
+   - Single yearly CSV per node in the HF Bucket (`N_tickers × 8` rows), with schema `symbol,timeframe,chunk,INITIAL,WEEK_4526,...` (`chunk` formatted as `EXCHANGE [1]`, `EXCHANGE [2]`, ...).
+   - Status codes: `1` (scanned), `""` (not scanned), `E1` (symbol/series error), `E2` (0 bars/empty), `E3` (intraday skipped), `E4` (transient network/socket error, retried on resume).
+   - **Chunk-Preserving Contract Insertion**: Newly added futures contracts for an existing root symbol are inserted immediately after that symbol's existing contracts with the same `chunk` label (`EXCHANGE [N]`), keeping downstream chunks completely stable.
+
+4. **Authenticated JWT Caching & Event-Driven Orchestration**:
+   - Persists encrypted per-node JWTs (`control/jwt/node_{0..19}.json.enc`) and orchestrator state (`control/state.json`) in the HF Bucket.
    - Never falls back to `unauthorized_user_token` (exits with `AUTH_FAILED` code `3` if no authenticated JWT with `user_id > 0` can be obtained).
-
-4. **Event-Driven GitHub + Kaggle Orchestration (No Cron)**:
-   - Orchestrator state lives in `control/state.json` inside the Hugging Face Bucket.
-   - Each Kaggle node runs under a `42,300s` (11h 45m) watchdog (`tdv.supervisor`) and dispatches `DONE`, `TIMEOUT`, `RATE_LIMITED`, `AUTH_FAILED`, or `ERROR` to `.github/workflows/fleet_orchestrator.yml`.
    - Between weekly runs, `tdv.standby_clock` chains 11h 45m sessions (`REARM_STANDBY`) until Monday `00:00:00 UTC`, when it dispatches `TRIGGER_WEEKLY`.
-
