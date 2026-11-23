@@ -33,6 +33,9 @@ import requests
 
 from tdv.bucket import BucketClient
 from tdv.config import (
+    BOOT_VERIFY_POLL_INTERVAL_SECONDS,
+    BOOT_VERIFY_STABLE_SECONDS,
+    BOOT_VERIFY_TIMEOUT_SECONDS,
     BUCKET_STATE_PATH,
     DEFAULT_GITHUB_REPO,
     DEFAULT_HF_BUCKET_ID,
@@ -43,6 +46,7 @@ from tdv.config import (
     RATE_LIMIT_COOLDOWN_SECONDS,
     TOTAL_KAGGLE_ACCOUNTS,
     TOTAL_NOTEBOOKS,
+    compute_next_monday_utc,
     compute_weekly_run_tag,
 )
 from tdv.pipeline import count_node_missing_tasks, count_node_task_stats
@@ -206,6 +210,107 @@ def wait_until_kernel_not_running(
     return state
 
 
+def verify_kernel_boot(
+    username: str,
+    slug: str,
+    api_token: str,
+    timeout_seconds: int = BOOT_VERIFY_TIMEOUT_SECONDS,
+    stable_seconds: int = BOOT_VERIFY_STABLE_SECONDS,
+    poll_interval: int = BOOT_VERIFY_POLL_INTERVAL_SECONDS,
+    not_found_grace_seconds: int = 25,
+    treat_complete_as_failure: bool = True,
+) -> tuple[bool, str]:
+    """
+    Poll Kaggle after a kernel push until the kernel enters `running` and stays
+    `running` continuously for `stable_seconds`.
+
+    Catches immediate Kaggle container-provisioning crashes (such as stale
+    service-account `SignBlob failed` errors) before GitHub Actions exits.
+    """
+    start_ts = time.time()
+    deadline = start_ts + max(timeout_seconds, stable_seconds + poll_interval)
+    running_since: float | None = None
+    last_state = "unknown"
+
+    # Short initial pause so Kaggle registers the newly pushed version
+    initial_pause = min(poll_interval, 8)
+    if initial_pause > 0:
+        time.sleep(initial_pause)
+
+    while time.time() < deadline:
+        state = get_kernel_state(username, slug, api_token)
+        last_state = state
+        elapsed = time.time() - start_ts
+
+        if state in ("error", "cancelacknowledged", "cancelrequested"):
+            print(
+                f"[FleetManager] Boot check FAILED for {username}/{slug}: state='{state}' "
+                f"(after {elapsed:.0f}s).",
+                flush=True,
+            )
+            return False, state
+
+        if state == "complete":
+            if treat_complete_as_failure:
+                print(
+                    f"[FleetManager] Boot check FAILED for {username}/{slug}: exited early "
+                    f"with state='complete' (after {elapsed:.0f}s).",
+                    flush=True,
+                )
+                return False, state
+            print(
+                f"[FleetManager] Boot check PASSED for {username}/{slug}: completed cleanly "
+                f"(after {elapsed:.0f}s).",
+                flush=True,
+            )
+            return True, state
+
+        if state == "not_found" and elapsed >= not_found_grace_seconds:
+            print(
+                f"[FleetManager] Boot check FAILED for {username}/{slug}: state='not_found' "
+                f"after {elapsed:.0f}s.",
+                flush=True,
+            )
+            return False, state
+
+        if state == "running":
+            now = time.time()
+            if running_since is None:
+                running_since = now
+                deadline = max(deadline, running_since + stable_seconds + poll_interval)
+                print(
+                    f"[FleetManager] {username}/{slug} entered 'running' (after {elapsed:.0f}s); "
+                    f"confirming stability for {stable_seconds}s...",
+                    flush=True,
+                )
+            elif now - running_since >= stable_seconds:
+                print(
+                    f"[FleetManager] Boot check PASSED for {username}/{slug} "
+                    f"(stable 'running' for {now - running_since:.0f}s).",
+                    flush=True,
+                )
+                return True, "running"
+        else:
+            running_since = None
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, remaining))
+
+    if running_since is not None:
+        final_state = get_kernel_state(username, slug, api_token)
+        last_state = final_state
+        if final_state == "running" and (time.time() - running_since) >= stable_seconds:
+            return True, "running"
+
+    print(
+        f"[FleetManager] Boot check TIMED OUT for {username}/{slug}: last_state='{last_state}'.",
+        flush=True,
+    )
+    return False, last_state
+
+
 def delete_kernel_if_exists(
     username: str,
     slug: str,
@@ -336,6 +441,37 @@ def delete_all_worker_kernels(
                     flush=True,
                 )
                 time.sleep(5)
+
+
+def delete_all_standby_kernels(
+    tokens: list[str],
+    usernames: dict[int, str],
+    exclude_account_idx: int | None = None,
+    wait_account_idx: int | None = None,
+    wait_seconds: int = 35,
+) -> None:
+    """Delete `tdv-standby` kernels across Kaggle accounts (optionally excluding the active one)."""
+    for acc_idx in range(TOTAL_KAGGLE_ACCOUNTS):
+        if exclude_account_idx is not None and acc_idx == exclude_account_idx:
+            continue
+        api_token = tokens[acc_idx] if acc_idx < len(tokens) else ""
+        username = usernames.get(acc_idx, "")
+        if not api_token or not username:
+            continue
+        if wait_account_idx is not None and acc_idx == wait_account_idx:
+            wait_until_kernel_not_running(
+                username,
+                "tdv-standby",
+                api_token,
+                max_wait_seconds=wait_seconds,
+                poll_interval=5,
+            )
+        delete_kernel_if_exists(
+            username=username,
+            slug="tdv-standby",
+            api_token=api_token,
+            wait_if_running=False,
+        )
 
 
 def default_fleet_state(phase: str = "initial", run_tag: str = "INITIAL") -> dict[str, Any]:
@@ -510,7 +646,10 @@ sys.exit(proc.returncode)
 '''
 
 
-def build_standby_runner_script() -> str:
+def build_standby_runner_script(
+    account_idx: int = 0,
+    session_id: str = "",
+) -> str:
     """Generate the self-bootstrapping script for `tdv-standby`."""
     gh_pat = os.environ.get("GH_PAT", "").strip()
     gh_repo = os.environ.get("GITHUB_REPO", DEFAULT_GITHUB_REPO).strip()
@@ -521,49 +660,70 @@ def build_standby_runner_script() -> str:
 import shutil
 import subprocess
 import sys
+import traceback
 
 os.environ["HF_HOME"] = "/tmp/hf_cache"
 os.environ["GH_PAT"] = {json.dumps(gh_pat)}
 os.environ["GITHUB_REPO"] = {json.dumps(gh_repo)}
 os.environ["HF_TOKEN"] = {json.dumps(hf_token)}
 os.environ["HF_BUCKET_ID"] = {json.dumps(hf_bucket)}
+os.environ["STANDBY_ACCOUNT_IDX"] = "{int(account_idx)}"
+os.environ["STANDBY_SESSION_ID"] = {json.dumps(session_id)}
 
-print("=== [TDV Standby Runner] Bootstrapping Standby Master Clock ===", flush=True)
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "requests", "huggingface_hub>=1.5.0"],
-    check=True,
-)
+print("=== [TDV Standby Runner] Bootstrapping Standby Master Clock (Account {int(account_idx)}, Session {session_id}) ===", flush=True)
 
 repo_dir = "/tmp/tdv_repo"
-if os.path.exists(repo_dir):
+exit_code = 1
+try:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "requests", "huggingface_hub>=1.5.0"],
+        check=True,
+    )
+    if os.path.exists(repo_dir):
+        shutil.rmtree(repo_dir, ignore_errors=True)
+
+    clone_url = f"https://{{os.environ['GH_PAT']}}@github.com/{gh_repo}.git" if os.environ.get("GH_PAT") else "https://github.com/{gh_repo}.git"
+    subprocess.run(["git", "clone", "--depth", "1", clone_url, repo_dir], check=True)
+
+    proc = subprocess.run([sys.executable, "-u", "-m", "tdv.standby_clock"], cwd=repo_dir)
+    exit_code = proc.returncode
+except Exception as exc:
+    print(f"[TDV Standby Runner] Bootstrap/runtime exception: {{exc}}", flush=True)
+    traceback.print_exc()
+    exit_code = 1
+finally:
+    if exit_code != 0 and os.environ.get("GH_PAT"):
+        import requests
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        st = "TRIGGER_WEEKLY" if now.weekday() == 0 else "REARM_STANDBY"
+        ph = "weekly" if st == "TRIGGER_WEEKLY" else "standby"
+        try:
+            requests.post(
+                f"https://api.github.com/repos/{gh_repo}/dispatches",
+                headers={{
+                    "Authorization": f"Bearer {{os.environ['GH_PAT']}}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }},
+                json={{
+                    "event_type": "node_callback",
+                    "client_payload": {{
+                        "node_id": 99,
+                        "status": st,
+                        "phase": ph,
+                        "account_idx": {int(account_idx)},
+                        "session_id": {json.dumps(session_id)},
+                    }},
+                }},
+                timeout=20,
+            )
+        except Exception:
+            pass
     shutil.rmtree(repo_dir, ignore_errors=True)
+    shutil.rmtree("/tmp/hf_cache", ignore_errors=True)
 
-clone_url = f"https://{{os.environ['GH_PAT']}}@github.com/{gh_repo}.git" if os.environ.get("GH_PAT") else "https://github.com/{gh_repo}.git"
-subprocess.run(["git", "clone", "--depth", "1", clone_url, repo_dir], check=True)
-
-proc = subprocess.run([sys.executable, "-u", "-m", "tdv.standby_clock"], cwd=repo_dir)
-if proc.returncode != 0 and os.environ.get("GH_PAT"):
-    import requests
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    st = "TRIGGER_WEEKLY" if now.weekday() == 0 else "REARM_STANDBY"
-    ph = "weekly" if st == "TRIGGER_WEEKLY" else "standby"
-    try:
-        requests.post(
-            f"https://api.github.com/repos/{gh_repo}/dispatches",
-            headers={{
-                "Authorization": f"Bearer {{os.environ['GH_PAT']}}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }},
-            json={{"event_type": "node_callback", "client_payload": {{"node_id": 99, "status": st, "phase": ph}}}},
-            timeout=20,
-        )
-    except Exception:
-        pass
-shutil.rmtree(repo_dir, ignore_errors=True)
-shutil.rmtree("/tmp/hf_cache", ignore_errors=True)
-sys.exit(proc.returncode)
+sys.exit(exit_code)
 '''
 
 
@@ -651,8 +811,10 @@ def push_worker_node(
     start_delay_seconds: int = 0,
     wait_if_running: bool = False,
     force_push: bool = False,
+    verify_boot: bool = False,
+    max_boot_retries: int = 3,
 ) -> bool:
-    """Push `tdv-node-{node_id}` to its assigned Kaggle account."""
+    """Push `tdv-node-{node_id}` to its assigned Kaggle account (with optional boot verification)."""
     acc_idx = get_account_index_for_node(node_id)
     api_token = tokens[acc_idx] if acc_idx < len(tokens) else ""
     username = usernames.get(acc_idx)
@@ -680,46 +842,289 @@ def push_worker_node(
         run_tag=run_tag,
         start_delay_seconds=start_delay_seconds,
     )
-    ok = _push_kernel_via_cli(username, slug, title, script_code, api_token)
-    if ok:
+
+    attempts = max(1, max_boot_retries) if verify_boot else 1
+    for attempt in range(1, attempts + 1):
+        if k_state in ("error", "cancelacknowledged") or attempt > 1:
+            delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
+
+        ok = _push_kernel_via_cli(username, slug, title, script_code, api_token)
+        if not ok:
+            if attempt < attempts:
+                time.sleep(10)
+            continue
+
+        if verify_boot:
+            boot_ok, boot_state = verify_kernel_boot(
+                username=username,
+                slug=slug,
+                api_token=api_token,
+                treat_complete_as_failure=False,
+            )
+            if not boot_ok:
+                print(
+                    f"[FleetManager] Worker {username}/{slug} failed boot verification "
+                    f"(attempt {attempt}/{attempts}, state='{boot_state}').",
+                    flush=True,
+                )
+                delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
+                if attempt < attempts:
+                    time.sleep(10)
+                continue
+
         now_iso = datetime.now(timezone.utc).isoformat()
         state["nodes"][str(node_id)]["status"] = "RUNNING"
         state["nodes"][str(node_id)]["launched_at"] = now_iso
         state["nodes"][str(node_id)]["updated_at"] = now_iso
-    return ok
+        return True
+
+    return False
+
+
+def _parse_iso_utc(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_weekly_due(state: dict[str, Any], now_utc: datetime) -> tuple[bool, str]:
+    """
+    Determine whether the weekly cycle `WEEK_<WWYY>` is due to trigger now.
+
+    Returns `(is_due, expected_week_tag)`. Handles both Monday UTC and late
+    recovery after Monday using `state["standby"]["next_weekly_utc"]`.
+    """
+    expected_tag = compute_weekly_run_tag(now_utc)
+    if str(state.get("run_tag", "")) == expected_tag:
+        return False, expected_tag
+
+    next_weekly_dt = _parse_iso_utc(state.get("standby", {}).get("next_weekly_utc"))
+    if next_weekly_dt is not None and now_utc >= next_weekly_dt:
+        return True, expected_tag
+
+    if now_utc.weekday() == 0:
+        return True, expected_tag
+
+    return False, expected_tag
 
 
 def push_standby_node(
     state: dict[str, Any],
     tokens: list[str],
     usernames: dict[int, str],
+    bucket: BucketClient | None = None,
+    start_account_idx: int | None = None,
+    rotate_from_account_idx: int | None = None,
     wait_if_running: bool = False,
+    verify_boot: bool = True,
+    max_rounds: int = 2,
 ) -> bool:
-    """Push `tdv-standby` on Kaggle Account 0."""
-    api_token = tokens[0] if tokens else ""
-    username = usernames.get(0)
-    if not api_token or not username:
-        print("[FleetManager] Cannot push tdv-standby: Account 0 not configured.", flush=True)
+    """
+    Push `tdv-standby` rotating round-robin across Kaggle accounts
+    (`0 -> 1 -> 2 -> 3 -> 0`) with post-push boot verification and automatic
+    failover across accounts if Kaggle container provisioning fails.
+    """
+    configured_accounts = [
+        idx
+        for idx in range(TOTAL_KAGGLE_ACCOUNTS)
+        if idx < len(tokens) and tokens[idx] and usernames.get(idx)
+    ]
+    if not configured_accounts:
+        print("[FleetManager] Cannot push tdv-standby: no Kaggle accounts configured.", flush=True)
         return False
+
+    sb_state = state.setdefault("standby", {})
+    now_dt = datetime.now(timezone.utc)
+    existing_next_weekly = _parse_iso_utc(sb_state.get("next_weekly_utc"))
+    if existing_next_weekly is not None and existing_next_weekly > now_dt:
+        next_weekly_iso = existing_next_weekly.isoformat()
+    else:
+        next_weekly_iso = compute_next_monday_utc(now_dt).isoformat()
+
+    raw_last_acc = sb_state.get("account_idx")
+    last_acc = int(raw_last_acc) if isinstance(raw_last_acc, int) or str(raw_last_acc).isdigit() else None
+
+    # During passive reconciliation (no explicit start/rotation), keep any already-running standby
+    if start_account_idx is None and rotate_from_account_idx is None:
+        check_order = configured_accounts
+        if last_acc in configured_accounts:
+            pos = configured_accounts.index(last_acc)
+            check_order = configured_accounts[pos:] + configured_accounts[:pos]
+        for acc_idx in check_order:
+            uname = usernames[acc_idx]
+            tok = tokens[acc_idx]
+            k_state = get_kernel_state(uname, "tdv-standby", tok)
+            if k_state in ("running", "queued"):
+                print(
+                    f"[FleetManager] Account {acc_idx} ({uname}/tdv-standby) is already '{k_state}'.",
+                    flush=True,
+                )
+                now_iso = datetime.now(timezone.utc).isoformat()
+                sb_state["status"] = "RUNNING"
+                sb_state["account_idx"] = acc_idx
+                sb_state["username"] = uname
+                sb_state.setdefault("next_weekly_utc", next_weekly_iso)
+                sb_state["updated_at"] = now_iso
+                if bucket is not None:
+                    save_fleet_state(bucket, state)
+                return True
+
+    # Determine starting account in round-robin order (0 -> 1 -> 2 -> 3 -> 0)
+    if rotate_from_account_idx is not None:
+        base_start = (int(rotate_from_account_idx) + 1) % TOTAL_KAGGLE_ACCOUNTS
+    elif start_account_idx is not None:
+        base_start = int(start_account_idx) % TOTAL_KAGGLE_ACCOUNTS
+    elif last_acc is not None:
+        # Recovering from a dead/crashed standby -> advance to the next account
+        base_start = (last_acc + 1) % TOTAL_KAGGLE_ACCOUNTS
+    else:
+        base_start = 0
+
+    ordered_accounts: list[int] = []
+    for offset in range(TOTAL_KAGGLE_ACCOUNTS):
+        cand = (base_start + offset) % TOTAL_KAGGLE_ACCOUNTS
+        if cand in configured_accounts:
+            ordered_accounts.append(cand)
 
     slug = "tdv-standby"
     title = "TDV Standby"
-    if wait_if_running:
-        k_state = wait_until_kernel_not_running(username, slug, api_token, max_wait_seconds=120)
-        if k_state not in ("running", "queued", "not_found"):
-            delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
-    else:
-        k_state = get_kernel_state(username, slug, api_token)
+    print(
+        f"[FleetManager] Launching {slug} with round-robin order {ordered_accounts} "
+        f"(rotate_from={rotate_from_account_idx}, verify_boot={verify_boot})...",
+        flush=True,
+    )
 
-    if k_state in ("running", "queued"):
-        print(f"[FleetManager] {username}/{slug} is already '{k_state}'.", flush=True)
-        state["standby"] = {"status": "RUNNING", "updated_at": datetime.now(timezone.utc).isoformat()}
-        return True
+    for round_num in range(1, max(1, max_rounds) + 1):
+        for acc_idx in ordered_accounts:
+            username = usernames[acc_idx]
+            api_token = tokens[acc_idx]
 
-    script_code = build_standby_runner_script()
-    ok = _push_kernel_via_cli(username, slug, title, script_code, api_token)
-    if ok:
-        state["standby"] = {"status": "RUNNING", "updated_at": datetime.now(timezone.utc).isoformat()}
+            # If failing all the way back to the retiring account, stop/delete it before re-pushing
+            if rotate_from_account_idx is not None and acc_idx == int(rotate_from_account_idx):
+                if wait_if_running:
+                    wait_until_kernel_not_running(username, slug, api_token, max_wait_seconds=60, poll_interval=5)
+                delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
+            else:
+                k_state = get_kernel_state(username, slug, api_token)
+                if k_state != "not_found":
+                    delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
+
+            session_id = f"sb_{acc_idx}_{int(time.time())}"
+            script_code = build_standby_runner_script(account_idx=acc_idx, session_id=session_id)
+            print(
+                f"[FleetManager] Standby push attempt (round {round_num}/{max_rounds}) -> "
+                f"Account {acc_idx} ({username}/{slug}, session={session_id})...",
+                flush=True,
+            )
+            pushed = _push_kernel_via_cli(username, slug, title, script_code, api_token)
+            if not pushed:
+                print(
+                    f"[FleetManager] Push failed on Account {acc_idx} ({username}/{slug}); failing over...",
+                    flush=True,
+                )
+                time.sleep(5)
+                continue
+
+            if verify_boot:
+                boot_ok, boot_state = verify_kernel_boot(
+                    username=username,
+                    slug=slug,
+                    api_token=api_token,
+                    treat_complete_as_failure=True,
+                )
+                if not boot_ok:
+                    print(
+                        f"[FleetManager] Standby boot FAILED on Account {acc_idx} "
+                        f"({username}/{slug} -> '{boot_state}'). Deleting and failing over to next account...",
+                        flush=True,
+                    )
+                    delete_kernel_if_exists(username, slug, api_token, wait_if_running=False)
+                    time.sleep(5)
+                    continue
+
+            # Verified running! Persist state BEFORE cleaning up old standby so the retiring
+            # session sees the new session_id in control/state.json and exits cleanly.
+            now_iso = datetime.now(timezone.utc).isoformat()
+            state["standby"] = {
+                "status": "RUNNING",
+                "account_idx": acc_idx,
+                "username": username,
+                "session_id": session_id,
+                "next_weekly_utc": next_weekly_iso,
+                "launched_at": now_iso,
+                "updated_at": now_iso,
+            }
+            if bucket is not None:
+                save_fleet_state(bucket, state)
+
+            delete_all_standby_kernels(
+                tokens=tokens,
+                usernames=usernames,
+                exclude_account_idx=acc_idx,
+                wait_account_idx=rotate_from_account_idx if rotate_from_account_idx != acc_idx else None,
+                wait_seconds=35,
+            )
+            print(
+                f"[FleetManager] Standby active on Account {acc_idx} ({username}/{slug}, "
+                f"session={session_id}, next_weekly={next_weekly_iso}).",
+                flush=True,
+            )
+            return True
+
+    print(
+        "[FleetManager] CRITICAL: Failed to boot tdv-standby on ALL configured Kaggle accounts!",
+        flush=True,
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    state["standby"] = {
+        "status": "ERROR",
+        "account_idx": last_acc if last_acc is not None else 0,
+        "next_weekly_utc": next_weekly_iso,
+        "updated_at": now_iso,
+    }
+    if bucket is not None:
+        save_fleet_state(bucket, state)
+    return False
+
+
+def _enter_standby_phase(
+    bucket: BucketClient,
+    state: dict[str, Any],
+    tokens: list[str],
+    usernames: dict[int, str],
+    wait_workers: bool = True,
+) -> bool:
+    """
+    Clean up finished worker notebooks, transition `state` to `'standby'`,
+    record the next Monday `00:00:00 UTC` deadline, and start standby rotation
+    at Account 0 (failing over automatically if Account 0 fails to boot).
+    """
+    delete_all_worker_kernels(tokens, usernames, wait_if_running=wait_workers)
+    now_dt = datetime.now(timezone.utc)
+    state["phase"] = "standby"
+    state["standby"] = {
+        "status": "STARTING",
+        "account_idx": 0,
+        "next_weekly_utc": compute_next_monday_utc(now_dt).isoformat(),
+        "updated_at": now_dt.isoformat(),
+    }
+    save_fleet_state(bucket, state)
+    ok = push_standby_node(
+        state=state,
+        tokens=tokens,
+        usernames=usernames,
+        bucket=bucket,
+        start_account_idx=0,
+        verify_boot=True,
+    )
+    save_fleet_state(bucket, state)
     return ok
 
 
@@ -739,9 +1144,11 @@ def reconcile_fleet(
     tokens: list[str],
     usernames: dict[int, str],
     force_push: bool = False,
-) -> None:
+    verify_batch_boot: bool = True,
+) -> bool:
     """
     Reconcile all 20 worker nodes (or `tdv-standby` when in `standby` phase).
+    Returns `True` on success, `False` if standby failed to boot across all accounts.
     """
     phase = str(state.get("phase", "initial"))
     run_tag = str(state.get("run_tag", "INITIAL" if phase == "initial" else phase))
@@ -752,20 +1159,39 @@ def reconcile_fleet(
         print(
             f"[FleetManager] All {TOTAL_NOTEBOOKS} nodes completed {run_tag}! "
             f"Deleting finished worker notebooks, transitioning fleet to 'standby' phase, "
-            f"and launching Standby Master Clock.",
+            f"and launching Standby Master Clock starting on Account 0.",
             flush=True,
         )
-        delete_all_worker_kernels(tokens, usernames, wait_if_running=True)
-        state["phase"] = "standby"
-        push_standby_node(state, tokens, usernames, wait_if_running=False)
-        save_fleet_state(bucket, state)
-        return
+        return _enter_standby_phase(bucket, state, tokens, usernames, wait_workers=True)
 
     if state.get("phase") == "standby":
-        push_standby_node(state, tokens, usernames, wait_if_running=False)
+        now_utc = datetime.now(timezone.utc)
+        weekly_due, expected_tag = _is_weekly_due(state, now_utc)
+        if weekly_due:
+            print(
+                f"[FleetManager] Standby reconcile detected overdue/due weekly cycle "
+                f"({expected_tag}) -> triggering TRIGGER_WEEKLY!",
+                flush=True,
+            )
+            return handle_node_callback(
+                node_id=99,
+                callback_status="TRIGGER_WEEKLY",
+                bucket=bucket,
+                state=state,
+                tokens=tokens,
+                usernames=usernames,
+            )
+        ok = push_standby_node(
+            state=state,
+            tokens=tokens,
+            usernames=usernames,
+            bucket=bucket,
+            verify_boot=True,
+        )
         save_fleet_state(bucket, state)
-        return
+        return ok
 
+    pushed_nodes: list[int] = []
     for i in range(TOTAL_NOTEBOOKS):
         node_info = nodes[str(i)]
         status = node_info.get("status", "IDLE")
@@ -799,7 +1225,7 @@ def reconcile_fleet(
             f"[FleetManager] Reconciling Node {i} (stored={status}, live={live_k}, force={force_push}) -> pushing kernel...",
             flush=True,
         )
-        push_worker_node(
+        ok = push_worker_node(
             i,
             state,
             tokens,
@@ -807,10 +1233,69 @@ def reconcile_fleet(
             start_delay_seconds=0,
             wait_if_running=False,
             force_push=force_push,
+            verify_boot=False,
         )
+        if ok:
+            pushed_nodes.append(i)
         time.sleep(2)
 
     save_fleet_state(bucket, state)
+
+    # Batch boot verification: catch immediate Kaggle provisioning crashes (e.g. SignBlob)
+    # on any freshly pushed worker nodes and retry them before exiting.
+    if verify_batch_boot and pushed_nodes:
+        pending_check = list(pushed_nodes)
+        for sweep in range(1, 3):
+            print(
+                f"[FleetManager] Batch boot check sweep {sweep}/2 for {len(pending_check)} "
+                f"pushed worker(s): sleeping 30s...",
+                flush=True,
+            )
+            time.sleep(30)
+            failed_nodes: list[int] = []
+            still_queued: list[int] = []
+            for node_id in pending_check:
+                acc_idx = get_account_index_for_node(node_id)
+                tok = tokens[acc_idx] if acc_idx < len(tokens) else ""
+                uname = usernames.get(acc_idx, "")
+                if not tok or not uname:
+                    continue
+                live_k = get_kernel_state(uname, f"tdv-node-{node_id}", tok)
+                if live_k in ("error", "cancelacknowledged"):
+                    failed_nodes.append(node_id)
+                elif live_k in ("queued", "unknown", "not_found"):
+                    still_queued.append(node_id)
+
+            if failed_nodes:
+                print(
+                    f"[FleetManager] Batch boot check detected immediate failure on worker(s) "
+                    f"{failed_nodes} -> deleting and re-pushing...",
+                    flush=True,
+                )
+                for node_id in failed_nodes:
+                    acc_idx = get_account_index_for_node(node_id)
+                    tok = tokens[acc_idx] if acc_idx < len(tokens) else ""
+                    uname = usernames.get(acc_idx, "")
+                    delete_kernel_if_exists(uname, f"tdv-node-{node_id}", tok, wait_if_running=False)
+                    push_worker_node(
+                        node_id,
+                        state,
+                        tokens,
+                        usernames,
+                        start_delay_seconds=0,
+                        wait_if_running=False,
+                        force_push=True,
+                        verify_boot=False,
+                    )
+                    time.sleep(2)
+                save_fleet_state(bucket, state)
+
+            pending_check = failed_nodes + still_queued
+            if not pending_check:
+                print("[FleetManager] All pushed worker nodes verified healthy!", flush=True)
+                break
+
+    return True
 
 
 def _is_stale_teardown_callback(
@@ -877,47 +1362,118 @@ def handle_node_callback(
     state: dict[str, Any],
     tokens: list[str],
     usernames: dict[int, str],
-) -> None:
+    callback_session_id: str = "",
+    callback_account_idx: int | None = None,
+    force_weekly: bool = False,
+) -> bool:
     """
     Process a `repository_dispatch` callback from a Kaggle worker or Standby Clock.
+    Returns `True` on success, `False` if standby failed to boot across all accounts.
     """
     cb = callback_status.strip().upper()
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
-    print(f"[FleetManager] Processing callback: node_id={node_id}, status={cb}", flush=True)
+    print(
+        f"[FleetManager] Processing callback: node_id={node_id}, status={cb}, "
+        f"acc={callback_account_idx}, sid={callback_session_id or 'n/a'}",
+        flush=True,
+    )
 
-    # Safety promotion: if REARM_STANDBY arrives on Monday UTC and this week's tag hasn't run yet,
-    # promote it to TRIGGER_WEEKLY so a Monday boundary handoff never misses the weekly launch.
-    if cb == "REARM_STANDBY" and now_utc.weekday() == 0:
-        expected_week_tag = compute_weekly_run_tag(now_utc)
-        if str(state.get("run_tag", "")) != expected_week_tag:
+    # Safety promotion: if REARM_STANDBY arrives when this week's cycle is due/overdue,
+    # promote it directly to TRIGGER_WEEKLY.
+    if cb == "REARM_STANDBY":
+        weekly_due, expected_week_tag = _is_weekly_due(state, now_utc)
+        if weekly_due:
             print(
-                f"[FleetManager] Promoting Monday REARM_STANDBY -> TRIGGER_WEEKLY ({expected_week_tag})",
+                f"[FleetManager] Promoting due REARM_STANDBY -> TRIGGER_WEEKLY ({expected_week_tag})",
                 flush=True,
             )
             cb = "TRIGGER_WEEKLY"
 
     # 1. Standby Clock Callbacks
     if cb == "REARM_STANDBY":
+        if state.get("phase") != "standby":
+            print(
+                f"[FleetManager] Ignoring stale REARM_STANDBY because fleet phase is already '{state.get('phase')}'.",
+                flush=True,
+            )
+            return True
+
+        sb_rec = state.get("standby", {})
+        active_sid = str(sb_rec.get("session_id", "")).strip()
+        raw_active_acc = sb_rec.get("account_idx")
+        active_acc = (
+            int(raw_active_acc)
+            if isinstance(raw_active_acc, int) or str(raw_active_acc).isdigit()
+            else None
+        )
+
+        # Idempotency guard: ignore duplicate/retried REARM_STANDBY from an already-rotated session
+        if active_acc is not None and active_acc < len(tokens) and tokens[active_acc] and usernames.get(active_acc):
+            is_stale_sid = bool(callback_session_id and active_sid and callback_session_id != active_sid)
+            launched_dt = _parse_iso_utc(sb_rec.get("launched_at"))
+            is_recent_launch = (
+                not callback_session_id
+                and launched_dt is not None
+                and (now_utc - launched_dt).total_seconds() < 600
+            )
+            if is_stale_sid or is_recent_launch:
+                live_sb = get_kernel_state(usernames[active_acc], "tdv-standby", tokens[active_acc])
+                if live_sb in ("running", "queued"):
+                    print(
+                        f"[FleetManager] Ignoring duplicate/stale REARM_STANDBY (cb_sid={callback_session_id or 'none'}) "
+                        f"because Account {active_acc} standby (sid={active_sid}) is already '{live_sb}'.",
+                        flush=True,
+                    )
+                    return True
+
+        prev_acc = callback_account_idx if callback_account_idx is not None else (active_acc if active_acc is not None else 0)
         state["phase"] = "standby"
-        push_standby_node(state, tokens, usernames, wait_if_running=True)
+        ok = push_standby_node(
+            state=state,
+            tokens=tokens,
+            usernames=usernames,
+            bucket=bucket,
+            rotate_from_account_idx=prev_acc,
+            wait_if_running=True,
+            verify_boot=True,
+        )
         save_fleet_state(bucket, state)
-        return
+        return ok
 
     if cb == "TRIGGER_WEEKLY":
         week_tag = compute_weekly_run_tag(now_utc)
+        if not force_weekly:
+            if state.get("phase") == week_tag:
+                print(
+                    f"[FleetManager] TRIGGER_WEEKLY for {week_tag} already active -> reconciling without reset.",
+                    flush=True,
+                )
+                return reconcile_fleet(bucket, state, tokens, usernames)
+            if state.get("phase") == "standby" and str(state.get("run_tag", "")) == week_tag:
+                print(
+                    f"[FleetManager] Ignoring duplicate TRIGGER_WEEKLY: {week_tag} already completed this week.",
+                    flush=True,
+                )
+                return push_standby_node(state=state, tokens=tokens, usernames=usernames, bucket=bucket, verify_boot=True)
+
         print(
-            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby and old worker notebooks, "
+            f"[FleetManager] TRIGGER_WEEKLY received -> deleting tdv-standby (all accounts) and old worker notebooks, "
             f"then starting {week_tag} across all 20 nodes (appending {week_tag} column to yearly CSV logs)!",
             flush=True,
         )
-        if tokens and usernames.get(0):
-            delete_kernel_if_exists(
-                username=usernames[0],
-                slug="tdv-standby",
-                api_token=tokens[0],
-                wait_if_running=True,
-            )
+        raw_active_acc = state.get("standby", {}).get("account_idx")
+        active_sb_acc = (
+            callback_account_idx
+            if callback_account_idx is not None
+            else (int(raw_active_acc) if isinstance(raw_active_acc, int) or str(raw_active_acc).isdigit() else 0)
+        )
+        delete_all_standby_kernels(
+            tokens=tokens,
+            usernames=usernames,
+            wait_account_idx=active_sb_acc,
+            wait_seconds=25,
+        )
         delete_all_worker_kernels(tokens, usernames, wait_if_running=False, verify_stopped=True)
         try:
             all_log_paths = bucket.list_paths(prefix="log", recursive=True)
@@ -930,8 +1486,7 @@ def handle_node_callback(
         state.clear()
         state.update(new_state)
         save_fleet_state(bucket, state)
-        reconcile_fleet(bucket, state, tokens, usernames, force_push=True)
-        return
+        return reconcile_fleet(bucket, state, tokens, usernames, force_push=True)
 
     # 2. Worker Node Callbacks (0..19)
     node_key = str(node_id)
@@ -942,7 +1497,7 @@ def handle_node_callback(
     if cb in ("TIMEOUT", "ERROR", "RATE_LIMITED") and _is_stale_teardown_callback(
         node_id, cb, node_rec, tokens, usernames, now_utc
     ):
-        return
+        return True
 
     node_rec["updated_at"] = now_iso
 
@@ -979,6 +1534,7 @@ def handle_node_callback(
                     usernames,
                     start_delay_seconds=0,
                     wait_if_running=True,
+                    verify_boot=True,
                 )
                 save_fleet_state(bucket, state)
             else:
@@ -989,8 +1545,7 @@ def handle_node_callback(
                     f"({missing_rate_pct:.3f}%) but exceeded max heal attempts ({retries}/{MAX_CONSECUTIVE_NODE_FAILURES}). Stopping loop.",
                     flush=True,
                 )
-            reconcile_fleet(bucket, state, tokens, usernames)
-            return
+            return reconcile_fleet(bucket, state, tokens, usernames)
 
         node_rec["status"] = "DONE"
         node_rec["retries"] = 0
@@ -1000,18 +1555,13 @@ def handle_node_callback(
         if all(state["nodes"][str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
             print(
                 f"[FleetManager] All {TOTAL_NOTEBOOKS} nodes are now DONE! "
-                "Deleting finished worker notebooks, transitioning to 'standby', and launching tdv-standby.",
+                "Deleting finished worker notebooks, transitioning to 'standby', and launching tdv-standby on Account 0.",
                 flush=True,
             )
-            delete_all_worker_kernels(tokens, usernames, wait_if_running=True)
-            state["phase"] = "standby"
-            push_standby_node(state, tokens, usernames, wait_if_running=False)
-            save_fleet_state(bucket, state)
-            return
+            return _enter_standby_phase(bucket, state, tokens, usernames, wait_workers=True)
 
         # Also reconcile any sibling nodes whose callbacks may have been coalesced by GitHub concurrency
-        reconcile_fleet(bucket, state, tokens, usernames)
-        return
+        return reconcile_fleet(bucket, state, tokens, usernames)
 
     if cb == "TIMEOUT":
         node_rec["status"] = "TIMEOUT"
@@ -1029,11 +1579,11 @@ def handle_node_callback(
             usernames,
             start_delay_seconds=0,
             wait_if_running=True,
+            verify_boot=True,
         )
         save_fleet_state(bucket, state)
         # Reconcile any other nodes whose TIMEOUT callbacks arrived concurrently
-        reconcile_fleet(bucket, state, tokens, usernames)
-        return
+        return reconcile_fleet(bucket, state, tokens, usernames)
 
     if cb == "AUTH_FAILED":
         node_rec["status"] = "AUTH_FAILED"
@@ -1043,7 +1593,7 @@ def handle_node_callback(
             "Not re-pushing to avoid anonymous scraping.",
             flush=True,
         )
-        return
+        return True
 
     if cb == "RATE_LIMITED":
         retries = int(node_rec.get("retries", 0)) + 1
@@ -1063,10 +1613,10 @@ def handle_node_callback(
                 usernames,
                 start_delay_seconds=RATE_LIMIT_COOLDOWN_SECONDS,
                 wait_if_running=True,
+                verify_boot=True,
             )
             save_fleet_state(bucket, state)
-        reconcile_fleet(bucket, state, tokens, usernames)
-        return
+        return reconcile_fleet(bucket, state, tokens, usernames)
 
     # Default: ERROR
     phase_str = str(state.get("phase", "initial"))
@@ -1094,16 +1644,11 @@ def handle_node_callback(
         if all(state["nodes"][str(i)].get("status") == "DONE" for i in range(TOTAL_NOTEBOOKS)):
             print(
                 f"[FleetManager] All {TOTAL_NOTEBOOKS} nodes are now DONE! "
-                "Deleting finished worker notebooks, transitioning to 'standby', and launching tdv-standby.",
+                "Deleting finished worker notebooks, transitioning to 'standby', and launching tdv-standby on Account 0.",
                 flush=True,
             )
-            delete_all_worker_kernels(tokens, usernames, wait_if_running=True)
-            state["phase"] = "standby"
-            push_standby_node(state, tokens, usernames, wait_if_running=False)
-            save_fleet_state(bucket, state)
-            return
-        reconcile_fleet(bucket, state, tokens, usernames)
-        return
+            return _enter_standby_phase(bucket, state, tokens, usernames, wait_workers=True)
+        return reconcile_fleet(bucket, state, tokens, usernames)
 
     retries = int(node_rec.get("retries", 0)) + 1
     node_rec["status"] = "ERROR"
@@ -1122,9 +1667,10 @@ def handle_node_callback(
             usernames,
             start_delay_seconds=ERROR_COOLDOWN_SECONDS,
             wait_if_running=True,
+            verify_boot=True,
         )
         save_fleet_state(bucket, state)
-    reconcile_fleet(bucket, state, tokens, usernames)
+    return reconcile_fleet(bucket, state, tokens, usernames)
 
 
 def print_fleet_status(
@@ -1156,10 +1702,22 @@ def print_fleet_status(
                 f"Bucket: {b_status:<8s} {miss_str:<13s} | Kaggle: {live_k:<10s} | Retries: {retries}"
             )
 
-    if tokens and usernames.get(0):
-        sb_live = get_kernel_state(usernames[0], "tdv-standby", tokens[0])
-        sb_bucket = state.get("standby", {}).get("status", "IDLE")
-        print(f"\n[Standby Clock ({usernames[0]}/tdv-standby)] Bucket: {sb_bucket} | Kaggle: {sb_live}")
+    sb_info = state.get("standby", {})
+    sb_bucket = sb_info.get("status", "IDLE")
+    sb_acc = sb_info.get("account_idx", "n/a")
+    sb_sid = sb_info.get("session_id", "n/a")
+    sb_next = sb_info.get("next_weekly_utc", "n/a")
+    print(
+        f"\n[Standby Clock] Bucket: {sb_bucket} | Active Acc: {sb_acc} | "
+        f"Session: {sb_sid} | Next Weekly: {sb_next}"
+    )
+    for acc_idx in range(TOTAL_KAGGLE_ACCOUNTS):
+        uname = usernames.get(acc_idx, "")
+        tok = tokens[acc_idx] if acc_idx < len(tokens) else ""
+        if tok and uname:
+            sb_live = get_kernel_state(uname, "tdv-standby", tok)
+            marker = " <-- active" if str(sb_acc) == str(acc_idx) else ""
+            print(f"  Acc {acc_idx} ({uname}/tdv-standby): Kaggle={sb_live}{marker}")
     print("=" * 78)
 
 
@@ -1168,10 +1726,13 @@ def main() -> int:
     parser.add_argument("--status", action="store_true", help="Print full fleet status")
     parser.add_argument("--reconcile", action="store_true", help="Reconcile and launch pending nodes")
     parser.add_argument("--push-node", type=int, default=None, help="Force-push a single worker node (0..19)")
-    parser.add_argument("--push-standby", action="store_true", help="Force-push the standby clock notebook")
+    parser.add_argument("--push-standby", action="store_true", help="Force-push the standby clock notebook (starting on Account 0)")
     parser.add_argument("--reset-phase", type=str, default=None, help="Reset fleet state to 'initial' or 'WEEK_<WWYY>'")
     parser.add_argument("--callback-node", type=int, default=None, help="Node ID from repository_dispatch callback")
     parser.add_argument("--callback-status", type=str, default=None, help="Status from repository_dispatch callback")
+    parser.add_argument("--callback-session-id", type=str, default="", help="Optional Standby session_id from callback payload")
+    parser.add_argument("--callback-account-idx", type=int, default=None, help="Optional Standby account_idx from callback payload")
+    parser.add_argument("--force-weekly", action="store_true", help="Force TRIGGER_WEEKLY even if current week tag is already active")
     args = parser.parse_args()
 
     bucket = BucketClient()
@@ -1188,51 +1749,57 @@ def main() -> int:
         r_tag = "INITIAL" if target.lower() == "initial" else target.upper()
         p_val = "initial" if target.lower() == "initial" else r_tag
         if p_val == "initial":
-            if tokens and usernames.get(0):
-                delete_kernel_if_exists(
-                    username=usernames[0],
-                    slug="tdv-standby",
-                    api_token=tokens[0],
-                    wait_if_running=False,
-                )
+            delete_all_standby_kernels(tokens, usernames)
             delete_all_worker_kernels(tokens, usernames, wait_if_running=False, verify_stopped=True)
         state = default_fleet_state(phase=p_val, run_tag=r_tag)
         save_fleet_state(bucket, state)
         print(f"[FleetManager] Reset fleet state to phase={p_val}, run_tag={r_tag}", flush=True)
 
     if args.callback_node is not None and args.callback_status:
-        handle_node_callback(
+        ok = handle_node_callback(
             node_id=args.callback_node,
             callback_status=args.callback_status,
             bucket=bucket,
             state=state,
             tokens=tokens,
             usernames=usernames,
+            callback_session_id=args.callback_session_id,
+            callback_account_idx=args.callback_account_idx,
+            force_weekly=args.force_weekly,
         )
-        return 0
+        return 0 if ok else 1
 
     if args.push_node is not None:
         state["nodes"].setdefault(str(args.push_node), {})["retries"] = 0
-        push_worker_node(args.push_node, state, tokens, usernames, wait_if_running=True, force_push=True)
+        ok = push_worker_node(
+            args.push_node,
+            state,
+            tokens,
+            usernames,
+            wait_if_running=True,
+            force_push=True,
+            verify_boot=True,
+        )
         save_fleet_state(bucket, state)
-        return 0
+        return 0 if ok else 1
 
     if args.push_standby:
         run_tag_str = str(state.get("run_tag", "WEEKLY"))
-        print(f"[FleetManager] Manual standby triggered for {run_tag_str} -> cleaning worker kernels and launching tdv-standby...", flush=True)
-        delete_all_worker_kernels(tokens, usernames, wait_if_running=False)
+        print(
+            f"[FleetManager] Manual standby triggered for {run_tag_str} -> "
+            "cleaning worker kernels and launching tdv-standby starting on Account 0...",
+            flush=True,
+        )
         for i in range(TOTAL_NOTEBOOKS):
             state["nodes"].setdefault(str(i), {})["status"] = "DONE"
             state["nodes"][str(i)]["retries"] = 0
             state["nodes"][str(i)]["integrity_verified"] = run_tag_str
-        state["phase"] = "standby"
-        push_standby_node(state, tokens, usernames, wait_if_running=True)
-        save_fleet_state(bucket, state)
-        return 0
+        ok = _enter_standby_phase(bucket, state, tokens, usernames, wait_workers=False)
+        return 0 if ok else 1
 
     if args.reconcile:
-        reconcile_fleet(bucket, state, tokens, usernames)
-        return 0
+        ok = reconcile_fleet(bucket, state, tokens, usernames)
+        return 0 if ok else 1
 
     print_fleet_status(state, tokens, usernames)
     return 0

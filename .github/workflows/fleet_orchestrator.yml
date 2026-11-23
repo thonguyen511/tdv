@@ -32,7 +32,7 @@ concurrency:
 jobs:
   orchestrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       KAGGLE_TOKEN_0: ${{ secrets.KAGGLE_TOKEN_0 }}
       KAGGLE_TOKEN_1: ${{ secrets.KAGGLE_TOKEN_1 }}
@@ -69,9 +69,18 @@ jobs:
         env:
           CB_NODE_ID: ${{ github.event.client_payload.node_id }}
           CB_STATUS: ${{ github.event.client_payload.status }}
+          CB_SESSION_ID: ${{ github.event.client_payload.session_id }}
+          CB_ACCOUNT_IDX: ${{ github.event.client_payload.account_idx }}
         run: |
-          echo "Received callback from Node ${CB_NODE_ID} with status ${CB_STATUS}"
-          python fleet_manager.py --callback-node "${CB_NODE_ID}" --callback-status "${CB_STATUS}"
+          echo "Received callback from Node ${CB_NODE_ID} with status ${CB_STATUS} (acc=${CB_ACCOUNT_IDX}, sid=${CB_SESSION_ID})"
+          ARGS=(--callback-node "${CB_NODE_ID}" --callback-status "${CB_STATUS}")
+          if [ -n "${CB_SESSION_ID}" ]; then
+            ARGS+=(--callback-session-id "${CB_SESSION_ID}")
+          fi
+          if [ -n "${CB_ACCOUNT_IDX}" ]; then
+            ARGS+=(--callback-account-idx "${CB_ACCOUNT_IDX}")
+          fi
+          python fleet_manager.py "${ARGS[@]}"
 
       - name: Handle Manual Workflow Dispatch
         if: github.event_name == 'workflow_dispatch'
@@ -88,7 +97,7 @@ jobs:
           elif [ "${ACTION}" = "reset_initial" ]; then
             python fleet_manager.py --reset-phase initial --reconcile
           elif [ "${ACTION}" = "trigger_weekly" ]; then
-            python fleet_manager.py --callback-node 99 --callback-status TRIGGER_WEEKLY
+            python fleet_manager.py --callback-node 99 --callback-status TRIGGER_WEEKLY --force-weekly
           else
             python fleet_manager.py --reconcile
           fi

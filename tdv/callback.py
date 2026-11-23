@@ -11,6 +11,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from typing import Any
+
 import requests
 
 if __package__ in (None, ""):
@@ -26,6 +28,7 @@ def send_github_callback(
     github_repo: str | None = None,
     gh_pat: str | None = None,
     max_retries: int = 4,
+    extra_payload: dict[str, Any] | None = None,
 ) -> bool:
     """
     Send a `repository_dispatch` (`event_type="node_callback"`) event to GitHub
@@ -44,14 +47,20 @@ def send_github_callback(
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    client_payload: dict[str, Any] = {
+        "node_id": int(node_id),
+        "status": str(status),
+        "phase": str(phase),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra_payload:
+        for k, v in extra_payload.items():
+            if v is not None:
+                client_payload[k] = v
+
     payload = {
         "event_type": "node_callback",
-        "client_payload": {
-            "node_id": int(node_id),
-            "status": str(status),
-            "phase": str(phase),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
+        "client_payload": client_payload,
     }
 
     for attempt in range(1, max_retries + 1):
@@ -83,8 +92,20 @@ def main() -> int:
     parser.add_argument("--node-id", type=int, required=True)
     parser.add_argument("--status", type=str, required=True)
     parser.add_argument("--phase", type=str, default="")
+    parser.add_argument("--session-id", type=str, default="")
+    parser.add_argument("--account-idx", type=int, default=None)
     args = parser.parse_args()
-    ok = send_github_callback(node_id=args.node_id, status=args.status, phase=args.phase)
+    extra: dict[str, Any] = {}
+    if args.session_id:
+        extra["session_id"] = args.session_id
+    if args.account_idx is not None:
+        extra["account_idx"] = args.account_idx
+    ok = send_github_callback(
+        node_id=args.node_id,
+        status=args.status,
+        phase=args.phase,
+        extra_payload=extra or None,
+    )
     return 0 if ok else 1
 
 

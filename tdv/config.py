@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,16 @@ DEFINITIVE_DONE_STATUSES = frozenset({
 # final chunk flush, /kaggle/working cleanup, and GitHub callback dispatch.
 DEFAULT_TIMEOUT_SECONDS = 42300
 
+# Standby clock runs 11h 30m (41,400s) per Kaggle session so there is a full
+# 30-minute margin for confirmed handoff & retry before Kaggle's 12h hard cap.
+STANDBY_MAX_SESSION_SECONDS = 41400
+
+# Post-push Kaggle kernel boot verification parameters (catches immediate
+# Kaggle infrastructure crashes such as stale-token SignBlob errors).
+BOOT_VERIFY_TIMEOUT_SECONDS = 150
+BOOT_VERIFY_STABLE_SECONDS = 30
+BOOT_VERIFY_POLL_INTERVAL_SECONDS = 10
+
 # Cooldown delay injected via START_DELAY_SECONDS when recovering from
 # RATE_LIMITED or transient ERROR without relying on a GitHub cron schedule.
 RATE_LIMIT_COOLDOWN_SECONDS = 900   # 15 minutes
@@ -181,6 +191,21 @@ def compute_weekly_run_tag(dt: datetime | None = None) -> str:
     week_num = now.strftime("%W")
     year_short = now.strftime("%y")
     return f"WEEK_{week_num}{year_short}"
+
+
+def compute_next_monday_utc(dt: datetime | None = None) -> datetime:
+    """Return the next Monday `00:00:00 UTC` strictly after `dt`."""
+    current = dt or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    days_ahead = (7 - current.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return (current + timedelta(days=days_ahead)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
 def get_repo_root() -> Path:

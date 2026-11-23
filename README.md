@@ -20,4 +20,4 @@ Modular, two-stage distributed market data pipeline across 20 Kaggle nodes, GitH
 4. **Authenticated JWT Caching & Event-Driven Orchestration**:
    - Persists encrypted per-node JWTs (`control/jwt/node_{0..19}.json.enc`) and orchestrator state (`control/state.json`) in the HF Bucket.
    - Never falls back to `unauthorized_user_token` (exits with `AUTH_FAILED` code `3` if no authenticated JWT with `user_id > 0` can be obtained).
-   - Between weekly runs, `tdv.standby_clock` chains 11h 45m sessions (`REARM_STANDBY`) until Monday `00:00:00 UTC`, when it dispatches `TRIGGER_WEEKLY`.
+   - Between weekly runs, `tdv.standby_clock` rotates Kaggle-only 11h 30m standby sessions round-robin across accounts (`Account 0 -> Account 1 -> Account 2 -> Account 3 -> Account 0`) with post-push boot verification, automatic multi-account failover, and handoff confirmation until Monday `00:00:00 UTC`, when it dispatches `TRIGGER_WEEKLY`.
