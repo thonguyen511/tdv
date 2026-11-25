@@ -42,15 +42,18 @@ TOTAL_KAGGLE_ACCOUNTS = 4
 CHUNK_SIZE = 2000
 
 # Worker pool sizing per notebook:
-# - Default Free-pool mode: all 8 workers connect to data.tradingview.com using
-#   the node's authenticated Free account JWT.
-# - Initial / Premium mode (when TV_ULTIMATE_* credentials are provided and verified):
+# - `(8, free)` mode (Weekly run, or Initial run when no Ultimate cookie is configured):
+#   all 8 workers connect to data.tradingview.com using the node's authenticated Free account JWT.
+# - `(8, flex)` mode (Initial run when TV_ULTIMATE_* credentials are provided and verified):
 #   5 Ultimate workers on prodata.tradingview.com + 3 Free workers on
-#   data.tradingview.com = 8 total workers (or Ultimate used in Phase 1 1D + Phase 2).
+#   data.tradingview.com = 8 total workers (flexing automatically to 8 Free workers if unset).
 TOTAL_WORKERS = 8
 FREE_POOL_WORKERS = 8
 ULTIMATE_POOL_WORKERS = 5
 FREE_DUAL_WORKERS = 3
+
+COOKIE_MODE_FLEX = "flex"
+COOKIE_MODE_FREE = "free"
 
 # ---------------------------------------------------------------------------
 # Timeframe Definitions (8 timeframes per symbol)

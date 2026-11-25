@@ -17,6 +17,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tdv.config import COOKIE_MODE_FLEX
 from tdv.pipeline import run_node_pipeline
 
 
@@ -41,6 +42,7 @@ def main() -> int:
         fetch_full_history=True,
         run_tag="INITIAL",
         max_chunks=args.max_chunks,
+        cookie_mode=COOKIE_MODE_FLEX,
     )
 
 

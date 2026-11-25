@@ -2,37 +2,33 @@
 Persistent WebSocket Worker Pool for Two-Stage Chunk Execution.
 
 Implements:
-- Persistent WebSocket connections per worker thread (reused across tasks by
-  creating/deleting `chart_create_session`, `quote_create_session`, and
-  optional `replay_create_session` on the open socket).
-- Stage 1 (`1D` + Universal Studies + `has_intraday` Filtering):
-  - Runs ALL studies for EVERY ticker extracted from the input CSV (no asset-type
-    filtering so nothing is omitted):
-    - Quote Session (`quote_set_fields` `["base_name", "short_name", "last_splits"]`)
-    - Chart Studies: `Splits`, `Dividends`, `Earnings`, and `BarSetContinuousRollDates`
-      (`st_roll_a` with `{"currenttime": "now"}` and `st_roll_b` with `{}`).
-  - Always requests `BARS_INITIAL_LOAD = 1_000_000` bars (TradingView WS API
-    automatically applies the cap associated with the active JWT).
-  - If a premium cookie/JWT is available during the `initial` job, Phase 1 (`1D`)
-    also runs on the premium endpoint for comprehensive studies & full depth.
-  - Captures `has_intraday` and `is_replayable` from `symbol_resolved`.
-- Stage 2 (`1W`, `1M`, and `has_intraday`-filtered intraday `1, 5, 15, 60, 240`):
-  - Initial job (`fetch_full_history=True`):
-    - Pages backwards via `request_more_data` (`1_000_000`).
-    - When a premium cookie/JWT is active on intraday intervals, runs WebSocket
-      Bar Replay backwards stepping (`_fetch_older_intraday_via_replay`) modeled on
-      `ref/TradingView-API/src/chart/session.js` to extend intraday history further back.
-  - Weekly job (`fetch_full_history=False`):
-    - Always runs with Free cookies/JWTs (`has_ultimate=False`).
-    - Requests `1_000_000` bars in a single batch; TradingView returns the Free
-      JWT's capped recent bars overlapping the previous week.
-  - Attaches corporate actions (`raw_split`, `raw_dividend`, `raw_earnings`, `raw_roll`)
-    to all intervals via `attach_events_to_df`.
+- Persistent WebSocket connections per worker thread with per-request JWT
+  authentication (`set_auth_token` sent on every WebSocket request) and a
+  thread-safe `TokenCoordinator` pause-and-refresh barrier when nearing JWT expiration.
+- Identical Two-Stage Scraping for both Initial (`(8, flex)`) and Weekly (`(8, free)`):
+  - Stage 1 (`1D` + Universal Studies + `has_intraday` Filtering):
+    - Runs ALL studies for EVERY ticker extracted from the input CSV (no asset-type
+      filtering or ticker skipping):
+      - Quote Session (`quote_set_fields` `["base_name", "short_name", "last_splits"]`)
+      - Chart Studies: `Splits`, `Dividends`, `Earnings`, and `BarSetContinuousRollDates`
+        (`st_roll_a` with `{"currenttime": "now"}` and `st_roll_b` with `{}`).
+    - Requests `BARS_INITIAL_LOAD = 1_000_000` bars and pages backwards via
+      `request_more_data` (`BARS_MORE_LOAD = 1_000_000`).
+    - Captures `has_intraday` and `is_replayable` from `symbol_resolved`.
+  - Stage 2 (`1W`, `1M`, and `has_intraday`-filtered intraday `1, 5, 15, 60, 240`):
+    - Requests `1,000,000` bars and pages backwards via `request_more_data` (`1,000,000`)
+      identically in both Initial and Weekly runs (duplicate `(symbol, time)` rows are
+      resolved at the final chunk merge step).
+    - When `(8, flex)` Ultimate workers are active on intraday intervals, extends
+      older history via WebSocket Bar Replay (`_fetch_older_intraday_via_replay`).
+    - Attaches corporate actions (`raw_split`, `raw_dividend`, `raw_earnings`, `raw_roll`)
+      to all intervals via `attach_events_to_df`.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import queue
 import random
 import ssl
@@ -58,7 +54,7 @@ from tdv.config import (
     STATUS_OK,
     get_ws_url,
 )
-from tdv.jwt_manager import JWTManager, TVAuthError
+from tdv.jwt_manager import JWTManager, TokenCoordinator, TVAuthError
 from tdv.protocol import (
     DEFAULT_STUDY_SCRIPTS,
     attach_events_to_df,
@@ -85,7 +81,10 @@ class ChunkExecutionContext:
     jwt_manager: JWTManager
     has_ultimate: bool = False
     ultimate_jwt: str | None = None
+    ult_sessionid: str = ""
+    ult_sessionid_sign: str = ""
     enable_bar_replay: bool = True
+    token_coordinator: TokenCoordinator | None = None
 
     # Queues
     primary_queue: queue.Queue[TaskItem | None] = field(default_factory=queue.Queue)
@@ -105,6 +104,34 @@ class ChunkExecutionContext:
     abort_event: threading.Event = field(default_factory=threading.Event)
     auth_failed_event: threading.Event = field(default_factory=threading.Event)
     consecutive_429_errors: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.ult_sessionid:
+            self.ult_sessionid = os.environ.get("TV_ULTIMATE_SESSIONID", "").strip()
+        if not self.ult_sessionid_sign:
+            self.ult_sessionid_sign = os.environ.get("TV_ULTIMATE_SESSIONID_SIGN", "").strip()
+        if self.token_coordinator is None:
+            self.token_coordinator = TokenCoordinator(
+                jwt_manager=self.jwt_manager,
+                has_ultimate=self.has_ultimate,
+                ultimate_jwt=self.ultimate_jwt,
+                ult_sessionid=self.ult_sessionid,
+                ult_sessionid_sign=self.ult_sessionid_sign,
+            )
+
+    def acquire_valid_jwt(self, is_ultimate: bool = False, force_refresh: bool = False) -> str:
+        """
+        Obtain a verified unexpired JWT for a WebSocket request, pausing all workers
+        via `self.token_coordinator` if the active token is nearing expiration.
+        """
+        assert self.token_coordinator is not None
+        tok = self.token_coordinator.acquire_jwt(
+            is_ultimate=is_ultimate,
+            force_refresh=force_refresh,
+        )
+        if is_ultimate and self.has_ultimate:
+            self.ultimate_jwt = tok
+        return tok
 
 
 def _connect_ws(ws_url: str, jwt_token: str, timeout: int = 15) -> websocket.WebSocket:
@@ -168,6 +195,12 @@ def _fetch_older_intraday_via_replay(
         auth_failed = False
 
         try:
+            try:
+                rp_jwt = ctx.acquire_valid_jwt(is_ultimate=True)
+            except TVAuthError:
+                return ws_buffer, True
+
+            ws.send(create_ws_message("set_auth_token", [rp_jwt]))
             ws.send(create_ws_message("replay_create_session", [replay_session]))
             ws.send(
                 create_ws_message(
@@ -274,6 +307,14 @@ def _fetch_older_intraday_via_replay(
                         if cur_count > prev_count and local_batches < 50:
                             prev_count = cur_count
                             local_batches += 1
+                            try:
+                                rp_jwt = ctx.acquire_valid_jwt(is_ultimate=True)
+                            except TVAuthError:
+                                auth_failed = True
+                                replay_ended = True
+                                done_window = True
+                                break
+                            ws.send(create_ws_message("set_auth_token", [rp_jwt]))
                             ws.send(
                                 create_ws_message(
                                     "request_more_data",
@@ -352,6 +393,14 @@ def _execute_task_on_ws(
     quote_session = generate_session_id("qs") if is_1d else None
     series_id = "sds_1"
     sym_id = "sds_sym_1"
+
+    # 0. Acquire verified unexpired JWT (pausing if nearing expiry) & attach to this WS request
+    try:
+        active_jwt = ctx.acquire_valid_jwt(is_ultimate=is_ultimate_worker)
+    except TVAuthError as auth_exc:
+        return "AUTH_ERROR", str(auth_exc), ws_buffer, {}, {}, {}
+
+    ws.send(create_ws_message("set_auth_token", [active_jwt]))
 
     # 1. Quote session on 1D for EVERY ticker (splits via last_splits)
     if is_1d and quote_session:
@@ -590,6 +639,14 @@ def _execute_task_on_ws(
                     ):
                         prev_bar_count = current_count
                         history_batches += 1
+                        try:
+                            active_jwt = ctx.acquire_valid_jwt(is_ultimate=is_ultimate_worker)
+                        except TVAuthError as auth_exc:
+                            status = "AUTH_ERROR"
+                            error_reason = str(auth_exc)
+                            done_loop = True
+                            break
+                        ws.send(create_ws_message("set_auth_token", [active_jwt]))
                         ws.send(
                             create_ws_message(
                                 "request_more_data",
@@ -770,11 +827,7 @@ def _worker_thread_loop(
 
             if ws is None:
                 try:
-                    jwt_tok = (
-                        ctx.ultimate_jwt
-                        if is_ultimate_worker and ctx.ultimate_jwt
-                        else ctx.jwt_manager.get_jwt(force_refresh=False)
-                    )
+                    jwt_tok = ctx.acquire_valid_jwt(is_ultimate=is_ultimate_worker)
                 except TVAuthError as auth_exc:
                     print(f"[Worker-{worker_id}] {auth_exc}", flush=True)
                     ctx.auth_failed_event.set()
@@ -847,11 +900,7 @@ def _worker_thread_loop(
                 _close_ws()
                 time.sleep(random.uniform(0.1, 0.3))
                 try:
-                    jwt_tok = (
-                        ctx.ultimate_jwt
-                        if is_ultimate_worker and ctx.ultimate_jwt
-                        else ctx.jwt_manager.get_jwt(force_refresh=False)
-                    )
+                    jwt_tok = ctx.acquire_valid_jwt(is_ultimate=is_ultimate_worker)
                     ws = _connect_ws(ws_url, jwt_tok)
                     ws_buffer = ""
                     (
@@ -881,14 +930,13 @@ def _worker_thread_loop(
 
             if status == "AUTH_ERROR":
                 _close_ws()
-                if not is_ultimate_worker:
-                    try:
-                        ctx.jwt_manager.get_jwt(force_refresh=True)
-                    except TVAuthError as auth_exc:
-                        print(f"[Worker-{worker_id}] {auth_exc}", flush=True)
-                        ctx.auth_failed_event.set()
-                        ctx.abort_event.set()
-                        break
+                try:
+                    ctx.acquire_valid_jwt(is_ultimate=is_ultimate_worker, force_refresh=True)
+                except TVAuthError as auth_exc:
+                    print(f"[Worker-{worker_id}] {auth_exc}", flush=True)
+                    ctx.auth_failed_event.set()
+                    ctx.abort_event.set()
+                    break
                 if task.retries < MAX_TASK_RETRIES:
                     task.retries += 1
                     with ctx.results_lock:
@@ -1083,7 +1131,7 @@ def run_task_batch_with_retries(
             time.sleep(backoff_sec)
             if round_num >= 2:
                 try:
-                    ctx.jwt_manager.get_jwt(force_refresh=True)
+                    ctx.acquire_valid_jwt(is_ultimate=False, force_refresh=True)
                 except Exception:
                     pass
         else:

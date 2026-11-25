@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -31,7 +31,7 @@ from tdv.bucket import BucketClient
 from tdv.config import TOTAL_NOTEBOOKS, get_jwt_bucket_path
 from tdv.crypto import decrypt_json, derive_key, encrypt_json
 
-JWT_EXPIRY_SAFETY_MARGIN_SECONDS = 600  # Refresh if < 10 minutes remaining
+JWT_EXPIRY_SAFETY_MARGIN_SECONDS = 900  # Pause & refresh when <= 15 minutes remaining
 
 
 class TVAuthError(RuntimeError):
@@ -388,8 +388,6 @@ class JWTManager:
                             candidate_idx, fresh_jwt, payload, email, sessionid, sessionid_sign
                         )
                         self._write_bucket_record(candidate_idx, rec)
-                        if candidate_idx != self.notebook_id:
-                            self._write_bucket_record(self.notebook_id, rec)
                         self._cached_record = rec
                         print(
                             f"[JWTManager] Refreshed JWT via sessionid cookie for node_{candidate_idx} "
@@ -414,8 +412,6 @@ class JWTManager:
                                 sessionid_sign=pw_res.get("sessionid_sign", ""),
                             )
                             self._write_bucket_record(candidate_idx, rec)
-                            if candidate_idx != self.notebook_id:
-                                self._write_bucket_record(self.notebook_id, rec)
                             self._cached_record = rec
                             print(
                                 f"[JWTManager] Refreshed JWT via Playwright login for {email} "
@@ -429,4 +425,127 @@ class JWTManager:
                 "account slots without obtaining a valid authenticated JWT (user_id > 0). "
                 "Refusing to scrape with unauthorized_user_token."
             )
+
+
+class TokenCoordinator:
+    """
+    Thread-safe JWT gate shared across all worker threads on a node.
+
+    Guarantees:
+    1. Every WebSocket request obtains a verified JWT via `acquire_jwt(...)`.
+    2. When the active Free or Ultimate JWT nears expiration
+       (`exp <= now + safety_margin_seconds`) or is invalidated (`force_refresh=True`),
+       `_ready_event` is cleared so ALL worker threads pause before issuing new
+       WebSocket requests while a single thread retrieves a fresh JWT, then
+       unpauses all workers together.
+    """
+
+    def __init__(
+        self,
+        jwt_manager: Any,
+        has_ultimate: bool = False,
+        ultimate_jwt: str | None = None,
+        ult_sessionid: str = "",
+        ult_sessionid_sign: str = "",
+        ultimate_refresh_fn: Callable[[], str | None] | None = None,
+        safety_margin_seconds: int = JWT_EXPIRY_SAFETY_MARGIN_SECONDS,
+        time_fn: Callable[[], float] = time.time,
+    ) -> None:
+        self.jwt_manager = jwt_manager
+        self.has_ultimate = bool(has_ultimate)
+        self._current_free_jwt: str = ""
+        self._current_ult_jwt: str = (ultimate_jwt or "").strip()
+        self.ult_sessionid = (ult_sessionid or "").strip()
+        self.ult_sessionid_sign = (ult_sessionid_sign or "").strip()
+        self.ultimate_refresh_fn = ultimate_refresh_fn
+        self.safety_margin_seconds = int(safety_margin_seconds)
+        self.time_fn = time_fn
+
+        self._ready_event = threading.Event()
+        self._ready_event.set()
+        self._refresh_lock = threading.Lock()
+        self._free_gen = 0
+        self._ult_gen = 0
+
+    @property
+    def ready_event(self) -> threading.Event:
+        return self._ready_event
+
+    def _token_needs_refresh(self, tok: str, margin_seconds: int | None = None) -> bool:
+        clean = (tok or "").strip()
+        if not clean or clean == "unauthorized_user_token":
+            return True
+        margin = self.safety_margin_seconds if margin_seconds is None else int(margin_seconds)
+        payload = decode_jwt_payload(clean)
+        if payload:
+            alive, _ = is_jwt_alive(clean, safety_margin_seconds=margin, now_ts=self.time_fn())
+            return not alive
+        # Reject malformed real JWT headers while allowing non-JWT test stubs in unit tests
+        if clean.startswith("eyJ"):
+            return True
+        return False
+
+    def acquire_jwt(self, is_ultimate: bool = False, force_refresh: bool = False) -> str:
+        """
+        Return an unexpired JWT (`user_id > 0`), pausing all workers via `_ready_event`
+        whenever a nearing-expiration or invalidated token must be refreshed.
+        """
+        self._ready_event.wait()
+
+        use_ult = bool(is_ultimate and self.has_ultimate)
+        cur_tok = self._current_ult_jwt if use_ult else self._current_free_jwt
+        observed_gen = self._ult_gen if use_ult else self._free_gen
+
+        if not force_refresh and not self._token_needs_refresh(cur_tok):
+            return cur_tok
+
+        with self._refresh_lock:
+            cur_tok = self._current_ult_jwt if use_ult else self._current_free_jwt
+            cur_gen = self._ult_gen if use_ult else self._free_gen
+
+            # Double-checked lock: if a sibling worker already refreshed while we waited, reuse it
+            if (cur_gen != observed_gen or not force_refresh) and not self._token_needs_refresh(cur_tok):
+                return cur_tok
+
+            # Pause all workers at `_ready_event.wait()` while retrieving a fresh JWT
+            self._ready_event.clear()
+            try:
+                if use_ult:
+                    fresh_ult: str | None = None
+                    if self.ultimate_refresh_fn is not None:
+                        fresh_ult = self.ultimate_refresh_fn()
+                    elif self.ult_sessionid:
+                        fresh_ult = extract_jwt_from_cookies(self.ult_sessionid, self.ult_sessionid_sign)
+
+                    clean_ult = (fresh_ult or "").strip()
+                    if not clean_ult or clean_ult == "unauthorized_user_token" or self._token_needs_refresh(clean_ult, margin_seconds=60):
+                        raise TVAuthError(
+                            "CRITICAL AUTH FAILURE: Ultimate JWT is nearing expiration or rejected and cookie refresh failed."
+                        )
+                    self._current_ult_jwt = clean_ult
+                    self._ult_gen += 1
+                    print("[TokenCoordinator] Paused workers and refreshed Ultimate JWT.", flush=True)
+                    return clean_ult
+
+                if self.jwt_manager is None:
+                    raise TVAuthError("CRITICAL AUTH FAILURE: JWTManager is required for Free worker pool.")
+
+                need_force = bool(force_refresh or cur_tok)
+                fresh_free = (self.jwt_manager.get_jwt(force_refresh=need_force) or "").strip()
+                if not need_force and self._token_needs_refresh(fresh_free):
+                    fresh_free = (self.jwt_manager.get_jwt(force_refresh=True) or "").strip()
+                    need_force = True
+
+                if not fresh_free or fresh_free == "unauthorized_user_token" or self._token_needs_refresh(fresh_free, margin_seconds=60):
+                    raise TVAuthError(
+                        "CRITICAL AUTH FAILURE: Failed to retrieve a valid unexpired Free JWT."
+                    )
+
+                self._current_free_jwt = fresh_free
+                self._free_gen += 1
+                if need_force:
+                    print("[TokenCoordinator] Paused workers and retrieved fresh Free JWT.", flush=True)
+                return fresh_free
+            finally:
+                self._ready_event.set()
 

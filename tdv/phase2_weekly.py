@@ -1,10 +1,12 @@
 """
-Weekly Job (`WEEK_<WWYY>` Incremental Maintenance).
+Weekly Job (`WEEK_<WWYY>` Scan).
 
-Always uses Free cookies/JWTs (no premium cookie needed after the initial run).
-Requests `1,000,000` bars per series (TradingView caps to the Free JWT limit,
-overlapping the previous week), overwrite-merges deduplicated by `["symbol", "time"]`,
-re-encrypts in place, and updates the `WEEK_<WWYY>` column in `log/node_{i}_{yyyy}.csv`.
+Operates 100% identically to the Initial job (`fetch_full_history=True`, `1,000,000`
+initial & `request_more_data` bar loads, universal `1D` studies + quote `last_splits`,
+and duplicate `(symbol, time)` rows deduplicated during the final chunk merge step),
+differing strictly in:
+1. Cookie selection: `(8, free)` (8 Free workers using the node's Free JWT).
+2. Yearly CSV log column: `WEEK_<WWYY>` in `log/node_{i}_{yyyy}.csv`.
 """
 
 from __future__ import annotations
@@ -17,12 +19,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tdv.config import compute_weekly_run_tag
+from tdv.config import COOKIE_MODE_FREE, compute_weekly_run_tag
 from tdv.pipeline import run_node_pipeline
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="TDV Phase 2: Weekly Incremental Maintenance")
+    parser = argparse.ArgumentParser(description="TDV Phase 2: Weekly Scan")
     parser.add_argument(
         "--notebook-id",
         type=int,
@@ -46,9 +48,10 @@ def main() -> int:
     run_tag = args.run_tag or compute_weekly_run_tag()
     return run_node_pipeline(
         notebook_id=args.notebook_id,
-        fetch_full_history=False,
+        fetch_full_history=True,
         run_tag=run_tag,
         max_chunks=args.max_chunks,
+        cookie_mode=COOKIE_MODE_FREE,
     )
 
 

@@ -13,7 +13,7 @@ import re
 import ssl
 import string
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,9 @@ def create_ws_message(func: str, param_list: list[Any]) -> str:
 def parse_ws_messages(buffer: str) -> tuple[list[str], str]:
     """
     Stream-parse complete `~m~<len>~m~<payload>` frames from `buffer`.
+    TradingView measures `<len>` in JavaScript UTF-16 code units (`+1` for BMP
+    characters `<= U+FFFF`, `+2` for astral characters `> U+FFFF` such as emojis
+    or mathematical symbols in token descriptions).
     Returns `(complete_messages, remaining_unparsed_buffer)`.
     """
     messages: list[str] = []
@@ -52,16 +55,40 @@ def parse_ws_messages(buffer: str) -> tuple[list[str], str]:
             break
         len_str = buffer[idx + 3 : end_len_idx]
         try:
-            msg_len = int(len_str)
+            target_u16_len = int(len_str)
         except ValueError:
             idx = end_len_idx + 3
             continue
         start_msg = end_len_idx + 3
-        end_msg = start_msg + msg_len
-        if end_msg > n:
+        if target_u16_len == 0:
+            messages.append("")
+            idx = start_msg
+            continue
+
+        pos = start_msg
+        u16_acc = 0
+        while pos < n and u16_acc < target_u16_len:
+            rem = target_u16_len - u16_acc
+            step_end = min(n, pos + rem)
+            chunk = buffer[pos:step_end]
+            if not chunk:
+                break
+            if ord(max(chunk)) <= 0xFFFF:
+                # Fast path: no astral characters in slice, UTF-16 len == Python len
+                u16_acc += len(chunk)
+                pos = step_end
+            else:
+                # Astral code points (> U+FFFF) count as 2 UTF-16 code units each
+                for ch in chunk:
+                    u16_acc += 2 if ord(ch) > 0xFFFF else 1
+                    pos += 1
+                    if u16_acc >= target_u16_len:
+                        break
+
+        if u16_acc < target_u16_len:
             break
-        messages.append(buffer[start_msg:end_msg])
-        idx = end_msg
+        messages.append(buffer[start_msg:pos])
+        idx = pos
     return messages, buffer[idx:]
 
 
@@ -126,13 +153,17 @@ DEFAULT_STUDY_SCRIPTS: dict[str, str] = {
 }
 
 
-def resolve_live_study_descriptors(jwt_token: str = "", max_attempts: int = 3) -> dict[str, str]:
+def resolve_live_study_descriptors(jwt_token: str, max_attempts: int = 3) -> dict[str, str]:
     """
     Query TradingView's live `request_studies_metadata` endpoint at startup
-    (with up to `max_attempts` retries) to dynamically resolve the latest study
-    version numbers for Splits, Dividends, Earnings, and Continuous Roll Dates.
-    Falls back to `DEFAULT_STUDY_SCRIPTS` only if all attempts fail.
+    authenticated with `jwt_token` (with up to `max_attempts` retries) to dynamically
+    resolve the latest study version numbers for Splits, Dividends, Earnings, and
+    Continuous Roll Dates. Falls back to `DEFAULT_STUDY_SCRIPTS` only if all attempts fail.
     """
+    auth_tok = (jwt_token or "").strip()
+    if not auth_tok or auth_tok == "unauthorized_user_token":
+        raise ValueError("resolve_live_study_descriptors requires a valid authenticated JWT.")
+
     scripts = dict(DEFAULT_STUDY_SCRIPTS)
     targets: dict[str, str] = {
         "Splits@tv-basicstudies-": "splits",
@@ -154,10 +185,11 @@ def resolve_live_study_descriptors(jwt_token: str = "", max_attempts: int = 3) -
                 timeout=15,
             )
             ws.recv()  # Initial handshake frame
-            ws.send(create_ws_message("set_auth_token", ["unauthorized_user_token"]))
+            ws.send(create_ws_message("set_auth_token", [auth_tok]))
             ws.send(create_ws_message("request_studies_metadata", ["st_meta_req"]))
 
             best_versions: dict[str, tuple[int, str]] = {}
+            ws_buf = ""
             start = time.time()
             done = False
 
@@ -166,8 +198,10 @@ def resolve_live_study_descriptors(jwt_token: str = "", max_attempts: int = 3) -
                 raw = ws.recv()
                 if not raw:
                     break
-                for part in raw.split("~m~"):
-                    if not part or part.isdigit():
+                ws_buf += raw
+                frames, ws_buf = parse_ws_messages(ws_buf)
+                for part in frames:
+                    if not part:
                         continue
                     if part.startswith("~h~"):
                         ws.send(f"~m~{len(part)}~m~{part}")
@@ -220,6 +254,30 @@ def resolve_live_study_descriptors(jwt_token: str = "", max_attempts: int = 3) -
                 except Exception:
                     pass
     return scripts
+
+
+def _sanitize_event_tuple(values: Sequence[Any]) -> tuple[Any, ...]:
+    """
+    Convert a study event sequence into a clean tuple, normalizing Pine Script
+    `na` sentinels (`>= 1e90` or `NaN`) to `None`.
+    """
+    cleaned: list[Any] = []
+    for item in values:
+        if isinstance(item, (float, np.floating)):
+            fval = float(item)
+            if np.isnan(fval) or np.isinf(fval) or abs(fval) >= 1e90:
+                cleaned.append(None)
+            else:
+                cleaned.append(fval)
+        elif isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            ival = int(item)
+            if abs(ival) >= 10**90:
+                cleaned.append(None)
+            else:
+                cleaned.append(ival)
+        else:
+            cleaned.append(item)
+    return tuple(cleaned)
 
 
 def attach_events_to_df(
@@ -306,7 +364,7 @@ def attach_events_to_df(
                 if idx is None and v[0] and float(v[0]) > 100000:
                     idx = find_target_idx(float(v[0]))
                 if idx is not None:
-                    df.iat[idx, df.columns.get_loc("raw_dividend")] = tuple(v)
+                    df.iat[idx, df.columns.get_loc("raw_dividend")] = _sanitize_event_tuple(v)
             except Exception:
                 pass
 
@@ -320,7 +378,7 @@ def attach_events_to_df(
                 if idx is None and v[0] and float(v[0]) > 100000:
                     idx = find_target_idx(float(v[0]))
                 if idx is not None:
-                    df.iat[idx, df.columns.get_loc("raw_earnings")] = tuple(v)
+                    df.iat[idx, df.columns.get_loc("raw_earnings")] = _sanitize_event_tuple(v)
             except Exception:
                 pass
 
@@ -332,7 +390,7 @@ def attach_events_to_df(
                 roll_ts = float(v[0])
                 idx = find_target_idx(roll_ts)
                 if idx is not None:
-                    df.iat[idx, df.columns.get_loc("raw_roll")] = tuple(v[:4])
+                    df.iat[idx, df.columns.get_loc("raw_roll")] = _sanitize_event_tuple(v[:4])
             except Exception:
                 pass
 
